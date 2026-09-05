@@ -12,6 +12,8 @@ Two kinds of job:
 
 from __future__ import annotations
 
+import gc
+import logging
 import queue
 import subprocess
 import sys
@@ -54,21 +56,47 @@ class _BaseJob:
         self._widget.after(80, self._pump)
 
     def _start(self, target) -> None:
+        # Collect garbage on the Tk thread before the worker starts, so no Tk
+        # object (a PhotoImage, say) gets finalised from the wrong thread.
+        gc.collect()
         self._thread = threading.Thread(target=target, daemon=True)
         self._thread.start()
         self._widget.after(80, self._pump)
+
+
+class _QueueHandler(logging.Handler):
+    """Forwards log records from the library into the job's queue."""
+
+    def __init__(self, put):
+        super().__init__(level=logging.INFO)
+        self._put = put
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self._put(self.format(record))
 
 
 class ThreadJob(_BaseJob):
     """Run a Python callable in a thread.
 
     The callable is given a ``log`` function it can call from the worker
-    thread; anything it logs appears in the UI on the next pump.
+    thread; anything it logs appears in the UI on the next pump.  With
+    ``capture_logger`` set, everything the named logger (and its children)
+    emits while the job runs is forwarded too - which is how the library's own
+    progress messages reach the log pane without the library knowing about
+    the GUI.
     """
 
-    def start(self, work: Callable[[Callable[[str], None]], None]) -> None:
+    def start(self, work: Callable[[Callable[[str], None]], None],
+              capture_logger: str | None = None) -> None:
         def runner():
             ok = True
+            handler = None
+            logger = None
+            if capture_logger:
+                logger = logging.getLogger(capture_logger)
+                handler = _QueueHandler(self._queue.put)
+                handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+                logger.addHandler(handler)
             try:
                 work(lambda line: self._queue.put(line))
             except Exception as exc:                      # noqa: BLE001 - shown to the user
@@ -76,6 +104,9 @@ class ThreadJob(_BaseJob):
                 self._queue.put(f"ERROR: {exc}")
                 for line in traceback.format_exc().splitlines()[-8:]:
                     self._queue.put("  " + line)
+            finally:
+                if logger is not None and handler is not None:
+                    logger.removeHandler(handler)
             self._queue.put(("__done__", ok))
 
         self._start(runner)

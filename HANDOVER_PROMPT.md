@@ -1,15 +1,18 @@
-# Task: finish the pvc-dlif GUI and drive the first real run
+# Task: drive the first real run of the pvc-dlif pipeline
 
-You are taking over a working but unfinished research repository for a master's thesis
-(FYS-3941, UiT). The owner is a physics student who knows Python and reads code
-comfortably — he is not afraid of the source, he just doesn't want to type long command
-lines dozens of times while producing thesis data.
+You are taking over a working research repository for a master's thesis (FYS-3941, UiT).
+The owner is a physics student who knows Python and reads code comfortably — he is not
+afraid of the source, he just doesn't want to type long command lines dozens of times while
+producing thesis data.
 
-Two things are wanted, in this order:
+**The code is complete and tested; what has never happened is a full run on the real data.**
+The GUI specified in section 5 is built and verified headlessly. The remaining work is:
 
-1. **Finish the Tkinter GUI.** A skeleton exists and runs. It is roughly 60 % of what is
-   specified in section 5; your job is the rest, not a rewrite.
-2. **Drive the first full run on the real 70-scan dataset** and fix what surfaces.
+1. **Install what the owner's machine lacks** — PETPVC, and a CUDA build of torch — which the
+   GUI's preflight page lists with the fix for each.
+2. **Drive the first full run on the real 70-scan dataset** and fix what surfaces. Expect
+   scale problems (memory, runtime, disk), not logic problems.
+3. Only then, anything on the GUI that the real run shows to be missing.
 
 Read sections 2, 3 and 8 before writing code. They exist to stop you re-deriving things that
 already cost days, and to stop you silently breaking the science.
@@ -38,8 +41,8 @@ pvc-dlif/
 ├── configs/thesis.yaml           # single source of truth; example.yaml is the template
 ├── src/pvc_dlif/                 # library: data/ pvc/ dlif/ eval/ motion/ report/ phantom/
 ├── scripts/00..08_*.py           # one CLI per stage, + run_all.py
-├── gui/pvc_dlif_gui/             # the GUI skeleton you are finishing
-├── tests/test_pipeline.py        # 85 tests, all passing
+├── gui/pvc_dlif_gui/             # the Tkinter GUI (four tabs, see section 5)
+├── tests/                        # ~100 tests, all passing (test_pipeline, test_gui, test_gui_support)
 │   tests/make_synthetic_dataset.py  # fake dataset in the real format (--write-config)
 └── docs/                         # getting-started, data, findings, methods
 ```
@@ -141,7 +144,13 @@ different matrix (128 × 120 × 120) but are all excluded.
 
 **No stage has ever run on the full 70-scan real dataset, and PETPVC is not installed on the
 owner's machine.** Installing it (`conda install -c conda-forge petpvc`) and confirming CUDA
-are the first two practical steps.
+are the first two practical steps — the Setup tab's preflight lists both.
+
+Stages 06 and 08 have additionally been run on synthetic data with fabricated prediction
+tables (to exercise the Analysis tab); those outputs prove the plumbing, nothing else.
+
+Test suite: `python -m pytest tests/` — 102 passed on the reference environment, plus the
+tkinter-dependent tests in `tests/test_gui.py` where tkinter is available.
 
 Reproduce the synthetic pass in minutes:
 
@@ -153,73 +162,43 @@ python scripts/run_all.py --config configs/synthetic.yaml --from 00 --to 03
 
 ---
 
-## 5. Finish the GUI
+## 5. The GUI — built, verified headlessly, never used on real data
 
-`gui/pvc_dlif_gui/` already runs (`python gui/run_gui.py`). What exists:
+`gui/pvc_dlif_gui/`, launched by `run_gui.bat` or `python gui/run_gui.py`. Four tabs.
 
-| Module | State |
-|---|---|
-| `app.py` | ✅ window, ttk theming, three tabs, status bar reporting PETPVC/torch availability |
-| `widgets.py` | ✅ `ToolTip`, `LogPane`, `PathPicker`, `LabelledEntry`, `TableView` |
-| `jobs.py` | ✅ `ThreadJob` and `ProcessJob` — queue-based, no widget is touched off the Tk thread |
-| `tab_pvc.py` | ⚠️ works on arbitrary NIfTI; parameters, sweep, sidecars, progress |
-| `tab_pipeline.py` | ⚠️ stage checkboxes, config check, sequential subprocess run with live output |
-| `tab_analysis.py` | ⚠️ loads result tables, summary panel, five plots, save-figure |
+| Module | What it does | Verified |
+|---|---|---|
+| `app.py` | window, four tabs, status bar with PETPVC/torch availability; opens on Setup when neither is installed | Xvfb |
+| `widgets.py` | `ToolTip`, `LogPane`, `PathPicker`, `LabelledEntry`, sortable+exportable `TableView`, `Banner`, `CheckList` | Xvfb |
+| `jobs.py` | `ThreadJob` (queue-pumped, captures `pvc_dlif` log records) and `ProcessJob` | Xvfb |
+| `detached.py` | stages as detached subprocesses, `gui_state.json`, log tailing, re-attach, exit code via `_wrap.py` | pytest + Xvfb |
+| `tab_setup.py` | four paths + key parameters saved back into the YAML with comments intact (`config_edit.py`), preflight with a fix per failed item (`preflight.py`) | Xvfb |
+| `tab_pvc.py` | pick files / thesis-dataset checklist from the manifest; RL/RVC, iterations or sweep, alpha, PSF, backend, workers; routed through `pvc.runner.run_batch` (resumable, diagnostics); Stop at scan boundary; results + per-frame tables | pytest + synthetic |
+| `tab_pipeline.py` | nine stages with lights and counts from `status.py`; banners for *n usable* and *median r*; detached runs, queue continues after restart | Xvfb, incl. failure and re-attach |
+| `tab_analysis.py` | summary, all tables, six figures via `report.figures` (shared with stage 08 through `report/assemble.py`), per-scan browser, Export for thesis | Xvfb on synthetic results |
 
-The threading model is already correct — **do not rewrite it.** Workers push strings onto a
-`queue.Queue`; the Tk thread drains it on an `after()` poll. Keep that contract.
+Library modules added for it, all tested without tkinter in `tests/test_gui_support.py`:
+`pvc_dlif/status.py`, `pvc_dlif/config_edit.py`, `pvc_dlif/preflight.py`,
+`pvc_dlif/report/assemble.py`. Stage 08 now calls `assemble` too, so the GUI and the thesis
+figures cannot disagree. `run_batch` gained a `should_stop` hook.
 
-### 5.1 What is missing — build these
+**The threading model is settled — do not rewrite it.** Short jobs: worker thread pushes
+strings onto a `queue.Queue`, the Tk thread drains it on `after()`. Long stages: detached
+`subprocess.Popen` writing to `<work>/logs/gui_<stage>_<stamp>.log`, state in
+`<work>/gui_state.json`, the GUI only tails. One subtlety already handled: garbage is
+collected on the Tk thread before a worker starts (`jobs._BaseJob._start`) because a
+matplotlib toolbar's `PhotoImage` finalised inside a worker thread stalls the event loop.
 
-**PVC tab**
-- A *Thesis dataset* input mode beside *Pick files*: a checkbox list of the 70 usable scan IDs
-  read from `<work>/manifest.json`, with select-all / none.
-- Route the batch through `pvc_dlif.pvc.runner.run_batch()` instead of calling
-  `backend.correct_volume` per frame as the skeleton does. `run_batch` already gives
-  resumability and the per-frame diagnostics; the current code throws both away.
-- A results `Treeview`: one row per scan × method × k with `noise_amplification` and
-  `peak_recovery` from `FrameDiagnostics`, plus CSV export.
-- Progress at *scan i of N, frame j of 42*, and a Stop that checks a `threading.Event`
-  **between scans** so a run interrupts cleanly rather than being killed.
+What *has not* been exercised, because it needs the owner's machine:
 
-**Pipeline tab**
-- Stage status computed **from the filesystem**, not held in memory, so it survives crashes:
-  count `native/*.nii.gz`, `pvc/<tag>/*.nii.gz`, `dlif_inputs/<tag>/`,
-  `models/<cond>/fold_XX/run_YY/summary.json`, `predictions/*.parquet`, `results/*.csv`,
-  `report/*`, and show "43 / 70 done" per stage with a status light.
-- Two results must be impossible to miss — a coloured banner, not a log line:
-  after stage 00, **n usable = 70** with the exclusion breakdown; after stage 01,
-  **`agreement_with_distributed_median_r` = 1.0**, naming any scan below 0.999.
-- Stage 05 runs for days. Record `{pid, stage, log_path}` in `<work>/gui_state.json` and
-  re-attach on restart by tailing the log, rather than orphaning or restarting the job.
+- the Windows-specific paths in `detached.py` (`CREATE_NEW_PROCESS_GROUP`, `taskkill`,
+  `OpenProcess` liveness) — written to the documented API, not run;
+- the PETPVC backend from the GUI (PETPVC is not installed anywhere it has been run);
+- stage 05 from the GUI for real (only a failing stage 05 and a fake long stage were used
+  to verify chaining, failure handling and re-attach).
 
-**Analysis tab**
-- Reuse `pvc_dlif.report.figures` for the plots rather than the ad-hoc matplotlib in the
-  skeleton — those functions already produce the thesis figures, so the GUI and the thesis
-  cannot disagree. Add: recovery vs noise amplification per frame coloured by count level,
-  and RMSE against iteration count.
-- Sortable `Treeview` columns and a CSV export per table.
-- A per-scan browser: pick a scan ID, see its curves under every condition plus its PVC
-  diagnostics. This is what he will use to find interesting cases for the Discussion.
-- An **Export for thesis** button copying `report/*.pdf` and the `.tex` fragments to a chosen
-  folder, ready for Overleaf.
-
-**Setup tab (does not exist yet — build it)**
-- The four paths, editable with Browse buttons, saved back to `configs/thesis.yaml`.
-- The few parameters worth changing from the GUI: `pvc.iterations_primary`, `pvc.methods`,
-  `dlif.cv.n_folds` / `n_runs`, `dlif.train.device`, `motion.affected_ids`. Everything else
-  stays in the YAML.
-- Validate on save by round-tripping through `pvc_dlif.config.load_config`, which already
-  raises informative errors (for example, a condition asking for an iteration count stage 02
-  never produced).
-- **Preflight check** with ✅/❌ per item and the exact fix for each ❌: Python dependencies,
-  `petpvc` on PATH, torch + CUDA, all four paths readable, free disk against an estimate.
-  He currently has no PETPVC — this is how he finds out.
-
-**Packaging**
-- `run_gui.bat` in the repository root, so it is a double-click on Windows.
-
----
+If any of these misbehave, that is the first GUI work to do. Otherwise leave the GUI alone
+until the real run has produced results.
 
 ## 6. Then: the real full run
 
@@ -298,14 +277,16 @@ Surface these; do not resolve them.
 
 ## 11. Acceptance criteria
 
-Done when the owner can:
+Done when the owner can (✅ = built and verified headlessly; ⬜ = needs the real machine):
 
-1. Double-click `run_gui.bat` and see a preflight page telling him exactly what to install.
-2. Select several scans, set method / iterations / FWHM, click Run, and watch per-frame
+1. ✅ Double-click `run_gui.bat` and see a preflight page telling him exactly what to install.
+2. ✅ Select several scans, set method / iterations / FWHM, click Run, and watch per-frame
    progress without the window freezing — and stop it cleanly if he changes his mind.
-3. Click through stages 00–08, close his laptop mid-run, come back, and see it still going.
-4. Read n = 70 and r = 1.0 as unmissable confirmations, not buried log lines.
-5. Open Analysis, read the headline numbers, look at every plot, and export the figures and
+3. ✅ Click through stages 00–08, close his laptop mid-run, come back, and see it still going
+   (verified on Linux; Windows detach path untested).
+4. ✅ Read n = 70 and r = 1.0 as unmissable confirmations, not buried log lines.
+5. ✅ Open Analysis, read the headline numbers, look at every plot, and export the figures and
    the LaTeX tables straight into Overleaf.
-6. Re-run everything from scratch on another machine and get identical numbers.
-7. Open any file you wrote and follow it without asking what it does.
+6. ⬜ Re-run everything from scratch on another machine and get identical numbers — needs
+   the first real run to have happened.
+7. ✅ Open any file you wrote and follow it without asking what it does.

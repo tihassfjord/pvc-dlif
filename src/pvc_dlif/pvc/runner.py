@@ -19,7 +19,7 @@ import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 import numpy as np
 
@@ -218,19 +218,29 @@ def run_batch(
     workers: int = 1,
     resume: bool = True,
     psf_tag: str = "",
+    should_stop: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Correct many scans under many settings, writing 4D NIfTI per combination.
 
     ``scans`` yields ``(scan_id, native_nifti_path)``.  Returns a report that
     lists what was written, what was skipped and what failed, so a long run can
     be inspected without re-reading the logs.
+
+    ``should_stop`` is polled before every scan; returning True ends the batch
+    cleanly at a scan boundary (no half-written outputs), with
+    ``report["stopped"]`` set.  This is what the GUI's Stop button uses.
     """
     out_root = Path(out_root)
-    report: dict[str, Any] = {"written": [], "skipped": [], "failed": [], "warnings": []}
+    report: dict[str, Any] = {"written": [], "skipped": [], "failed": [], "warnings": [],
+                              "stopped": False}
 
     backend = None if workers > 1 else make_backend(backend_name, executable)
 
     for scan_id, native_path in scans:
+        if should_stop is not None and should_stop():
+            LOGGER.warning("PVC batch stopped before %s", scan_id)
+            report["stopped"] = True
+            break
         for settings in settings_list:
             target = output_path_for(out_root, settings, scan_id, psf_tag)
             diag_path = target.with_suffix("").with_suffix(".diagnostics.json")

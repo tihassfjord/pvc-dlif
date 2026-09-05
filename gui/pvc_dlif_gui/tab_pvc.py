@@ -1,23 +1,27 @@
-"""PVC tab: deconvolve one image or a batch of them.
+"""PVC tab: deconvolve one image, a folder of them, or a set of thesis scans.
 
-Accepts 3D volumes and 4D dynamic series (each frame corrected independently,
-which is what the pipeline does).  Every parameter that changes the result is
-on screen, and the exact settings are written next to each output as a small
-JSON sidecar so a result can always be traced back to how it was made.
+Two ways to choose the input.  *Pick files* takes any NIfTI (3D or 4D) - for
+trying things outside the 70.  *Thesis dataset* lists the usable scan IDs
+from ``manifest.json`` and reads their native series from ``<work>/native``,
+so this tab can stand in for stage 02 on a subset.
+
+Either way the work goes through :func:`pvc_dlif.pvc.runner.run_batch`, the
+same function stage 02 calls.  That gives resumability (existing outputs are
+skipped), the per-frame diagnostics, and one implementation to trust.  The
+GUI only collects parameters and shows what came back.
 """
 
 from __future__ import annotations
 
-import json
+import threading
 import tkinter as tk
-from datetime import datetime
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 from .jobs import ThreadJob
-from .widgets import LabelledEntry, LogPane, PathPicker, ToolTip
+from .widgets import CheckList, LabelledEntry, LogPane, PathPicker, TableView, ToolTip
 
-# Defaults are the LabPET8 values measured in the project thesis.
+# LabPET8 values measured in the project thesis; the config overrides them.
 DEFAULT_FWHM = (0.864, 0.874, 0.994)
 
 
@@ -27,23 +31,32 @@ class PVCTab(ttk.Frame):
         super().__init__(parent, padding=10)
         self.app = app
         self.job: ThreadJob | None = None
+        self.stop_event = threading.Event()
         self._build()
+        self.after(300, self._prefill_from_config)
 
-    # ---------------------------------------------------------------- #
+    # ================================================================ #
     # Layout
-    # ---------------------------------------------------------------- #
+    # ================================================================ #
     def _build(self) -> None:
-        # --- inputs ---------------------------------------------------
-        io_box = ttk.LabelFrame(self, text="Input / output", padding=8)
+        # ----- input ------------------------------------------------------
+        io_box = ttk.LabelFrame(self, text="Input", padding=8)
         io_box.pack(fill="x")
 
-        self.inputs = PathPicker(
-            io_box, "Images", kind="files",
-            tooltip="One or more NIfTI files (.nii/.nii.gz). 3D or 4D; "
-                    "4D series are corrected frame by frame.")
-        self.inputs.pack(fill="x", pady=2)
+        mode_row = ttk.Frame(io_box)
+        mode_row.pack(fill="x")
+        self.mode = tk.StringVar(value="files")
+        for value, text in (("files", "Pick files"), ("thesis", "Thesis dataset")):
+            ttk.Radiobutton(mode_row, text=text, value=value, variable=self.mode,
+                            command=self._switch_mode).pack(side="left", padx=(0, 12))
 
-        row = ttk.Frame(io_box)
+        # Pick-files panel
+        self.files_panel = ttk.Frame(io_box)
+        self.inputs = PathPicker(
+            self.files_panel, "Images", kind="files",
+            tooltip="One or more NIfTI files. 3D or 4D; a 4D series is corrected frame by frame.")
+        self.inputs.pack(fill="x", pady=2)
+        row = ttk.Frame(self.files_panel)
         row.pack(fill="x", pady=2)
         ttk.Button(row, text="Add whole folder…", command=self._add_folder).pack(side="left")
         ttk.Button(row, text="Clear", command=lambda: self.inputs.var.set("")).pack(side="left", padx=4)
@@ -51,96 +64,120 @@ class PVCTab(ttk.Frame):
         self.count_label.pack(side="left", padx=10)
         self.inputs.var.trace_add("write", lambda *_: self._update_count())
 
+        # Thesis-dataset panel
+        self.thesis_panel = ttk.Frame(io_box)
+        head = ttk.Frame(self.thesis_panel)
+        head.pack(fill="x")
+        self.thesis_info = ttk.Label(head, text="", foreground="#555")
+        self.thesis_info.pack(side="left")
+        ttk.Button(head, text="Reload from manifest", command=self._load_manifest).pack(side="right")
+        self.scan_list = CheckList(self.thesis_panel, height=6, columns=8)
+        self.scan_list.pack(fill="x", pady=(4, 0))
+
         self.outdir = PathPicker(
             io_box, "Output folder", kind="dir",
-            tooltip="Corrected images land here as <name>_<method>_i<iterations>.nii.gz")
-        self.outdir.pack(fill="x", pady=2)
+            tooltip="Outputs land in <folder>/<method>_i<k>/<scan>.nii.gz with a diagnostics "
+                    "JSON beside each. For the thesis dataset this defaults to <work>/pvc, "
+                    "which is exactly where stage 02 writes.")
+        self.outdir.pack(fill="x", pady=(6, 2))
 
-        # --- parameters -----------------------------------------------
+        # ----- correction -------------------------------------------------
         par_box = ttk.LabelFrame(self, text="Correction", padding=8)
         par_box.pack(fill="x", pady=(8, 0))
 
         line1 = ttk.Frame(par_box)
         line1.pack(fill="x", pady=2)
+        ttk.Label(line1, text="Method").pack(side="left", padx=(0, 6))
+        self.use_rl = tk.BooleanVar(value=True)
+        self.use_rvc = tk.BooleanVar(value=False)
+        rl = ttk.Checkbutton(line1, text="RL", variable=self.use_rl)
+        rvc = ttk.Checkbutton(line1, text="RVC", variable=self.use_rvc)
+        rl.pack(side="left")
+        rvc.pack(side="left", padx=(4, 12))
+        ToolTip(rl, "Richardson-Lucy: multiplicative, non-negative by construction.")
+        ToolTip(rvc, "Reblurred Van Cittert: additive, faster, noisier. Uses alpha.")
 
-        ttk.Label(line1, text="Method").pack(side="left", padx=(0, 4))
-        self.method = tk.StringVar(value="RL")
-        method_box = ttk.Combobox(line1, textvariable=self.method, width=6,
-                                  state="readonly", values=("RL", "RVC"))
-        method_box.pack(side="left")
-        ToolTip(method_box,
-                "RL: Richardson-Lucy, multiplicative, non-negative.\n"
-                "RVC: Reblurred Van Cittert, additive, faster but noisier.")
-
-        self.iterations = LabelledEntry(
-            line1, "Iterations", 15, tooltip="Fixed iteration count, applied to every frame.")
-        self.iterations.pack(side="left", padx=12)
-
-        self.alpha = LabelledEntry(
-            line1, "Alpha", 1.5, tooltip="RVC relaxation parameter. Ignored for RL.")
-        self.alpha.pack(side="left", padx=(0, 12))
-
-        self.no_stop = tk.BooleanVar(value=True)
-        stop_check = ttk.Checkbutton(line1, text="Run exact iteration count",
-                                     variable=self.no_stop)
-        stop_check.pack(side="left")
-        ToolTip(stop_check, "Disables PETPVC's internal stopping criterion (-s 0) so the "
-                            "iteration count you set is the count that runs.")
+        self.iterations = LabelledEntry(line1, "Iterations", 15,
+                                        tooltip="Fixed count applied to every frame.")
+        self.iterations.pack(side="left")
+        self.sweep_on = tk.BooleanVar(value=False)
+        sweep = ttk.Checkbutton(line1, text="Sweep", variable=self.sweep_on)
+        sweep.pack(side="left", padx=(12, 2))
+        self.sweep_values = LabelledEntry(line1, "", "10, 15, 20", width=12,
+                                          tooltip="Iteration counts to run instead of the single value. "
+                                                  "This is the sensitivity analysis, not a search.")
+        self.sweep_values.pack(side="left")
+        ToolTip(sweep, "Run every count in the list instead of the single value.")
+        self.alpha = LabelledEntry(line1, "Alpha", 1.5, width=6,
+                                   tooltip="RVC relaxation parameter. Ignored for RL.")
+        self.alpha.pack(side="left", padx=(14, 0))
 
         line2 = ttk.Frame(par_box)
-        line2.pack(fill="x", pady=6)
+        line2.pack(fill="x", pady=4)
         ttk.Label(line2, text="PSF FWHM (mm)").pack(side="left", padx=(0, 6))
         self.fwhm = [LabelledEntry(line2, axis, value, width=7,
-                                   tooltip=f"Point-spread FWHM along {axis}, in millimetres.")
+                                   tooltip=f"Point-spread FWHM along {axis} in mm. Prefilled "
+                                           "from psf.fwhm_mm in the config.")
                      for axis, value in zip("xyz", DEFAULT_FWHM)]
         for entry in self.fwhm:
             entry.pack(side="left", padx=3)
 
-        ttk.Label(line2, text="   Backend").pack(side="left", padx=(16, 4))
+        ttk.Label(line2, text="   Backend").pack(side="left", padx=(14, 4))
         self.backend = tk.StringVar(value="petpvc")
-        backend_box = ttk.Combobox(line2, textvariable=self.backend, width=8,
-                                   state="readonly", values=("petpvc", "numpy"))
+        backend_box = ttk.Combobox(line2, textvariable=self.backend, width=22, state="readonly",
+                                   values=("petpvc", "numpy (development only)"))
         backend_box.pack(side="left")
-        ToolTip(backend_box,
-                "petpvc: the validated toolbox - use this for anything you will report.\n"
-                "numpy: built-in fallback, for when the binary is not installed.")
+        ToolTip(backend_box, "petpvc: the validated toolbox - anything you report comes from it.\n"
+                             "numpy: built-in fallback so the GUI works without the binary.")
 
         self.workers = LabelledEntry(line2, "Workers", 4, width=5,
-                                     tooltip="Frames corrected in parallel, per scan.")
+                                     tooltip="Frames corrected in parallel within a scan.")
         self.workers.pack(side="left", padx=12)
+        self.resume = tk.BooleanVar(value=True)
+        resume = ttk.Checkbutton(line2, text="Skip existing", variable=self.resume)
+        resume.pack(side="left")
+        ToolTip(resume, "Outputs that already exist are not recomputed.")
 
-        # --- sweep ----------------------------------------------------
-        sweep_box = ttk.LabelFrame(self, text="Iteration sweep (optional)", padding=8)
-        sweep_box.pack(fill="x", pady=(8, 0))
-        self.sweep_on = tk.BooleanVar(value=False)
-        ttk.Checkbutton(sweep_box, text="Run every count below instead of the single value above",
-                        variable=self.sweep_on).pack(side="left")
-        self.sweep_values = LabelledEntry(sweep_box, "", "10, 15, 20", width=18,
-                                          tooltip="Comma-separated iteration counts.")
-        self.sweep_values.pack(side="left", padx=8)
-
-        # --- run ------------------------------------------------------
+        # ----- run --------------------------------------------------------
         run_row = ttk.Frame(self)
         run_row.pack(fill="x", pady=8)
         self.run_button = ttk.Button(run_row, text="Run PVC", command=self._run)
         self.run_button.pack(side="left")
-        self.cancel_button = ttk.Button(run_row, text="Cancel", command=self._cancel,
-                                        state="disabled")
-        self.cancel_button.pack(side="left", padx=6)
-        self.progress = ttk.Progressbar(run_row, mode="determinate", length=280)
+        self.stop_button = ttk.Button(run_row, text="Stop", command=self._stop, state="disabled")
+        self.stop_button.pack(side="left", padx=6)
+        ToolTip(self.stop_button, "Stops at the next scan boundary; the current scan finishes.")
+        self.progress = ttk.Progressbar(run_row, mode="determinate", length=260)
         self.progress.pack(side="left", padx=12)
         self.status = ttk.Label(run_row, text="idle")
         self.status.pack(side="left")
 
-        self.log = LogPane(self, height=14)
-        self.log.pack(fill="both", expand=True)
+        # ----- log + results ---------------------------------------------
+        panes = ttk.Notebook(self)
+        panes.pack(fill="both", expand=True)
+        self.log = LogPane(panes, height=12)
+        panes.add(self.log, text="Log")
+        self.results = TableView(panes, height=12)
+        panes.add(self.results, text="Results")
+        self.frames_table = TableView(panes, height=12)
+        panes.add(self.frames_table, text="Per frame")
+        self.panes = panes
 
-    # ---------------------------------------------------------------- #
-    # Helpers
-    # ---------------------------------------------------------------- #
+        self._switch_mode()
+
+    # ================================================================ #
+    # Input helpers
+    # ================================================================ #
+    def _switch_mode(self) -> None:
+        if self.mode.get() == "files":
+            self.thesis_panel.pack_forget()
+            self.files_panel.pack(fill="x", before=self.outdir)
+        else:
+            self.files_panel.pack_forget()
+            self.thesis_panel.pack(fill="x", before=self.outdir)
+            if not self.scan_list.vars:
+                self._load_manifest()
+
     def _add_folder(self) -> None:
-        """Append every NIfTI in a chosen folder to the file list."""
-        from tkinter import filedialog
         folder = filedialog.askdirectory(title="Folder of NIfTI images")
         if not folder:
             return
@@ -155,140 +192,227 @@ class PVCTab(ttk.Frame):
         n = len(self.inputs.paths())
         self.count_label.configure(text=f"{n} file{'' if n == 1 else 's'}")
 
+    def _config(self):
+        """The loaded config, or None with the reason shown in the status bar."""
+        path = self.app.pipeline_tab.config_path.path()
+        if not path or not path.exists():
+            return None
+        try:
+            from pvc_dlif.config import load_config
+            return load_config(path)
+        except Exception as exc:                            # noqa: BLE001
+            self.thesis_info.configure(text=f"config error: {exc}")
+            return None
+
+    def _prefill_from_config(self) -> None:
+        """PSF, iterations and alpha from the config, so defaults match the thesis."""
+        config = self._config()
+        if config is None:
+            return
+        for entry, value in zip(self.fwhm, config.fwhm_mm):
+            entry.var.set(str(value))
+        self.iterations.var.set(str(config.iterations_primary))
+        self.sweep_values.var.set(", ".join(str(k) for k in config.iterations_grid))
+        self.alpha.var.set(str(config.get("pvc.rvc_alpha", 1.5)))
+        self.workers.var.set(str(config.get("pvc.workers", 4)))
+        methods = {str(m).upper() for m in config.pvc_methods}
+        self.use_rl.set("RL" in methods)
+        self.use_rvc.set("RVC" in methods)
+
+    def _load_manifest(self) -> None:
+        """Fill the scan list with usable IDs that have a native series."""
+        config = self._config()
+        if config is None:
+            self.thesis_info.configure(text="No config loaded - set one on the Pipeline tab.")
+            return
+        from pvc_dlif.status import manifest_summary
+        summary = manifest_summary(config)
+        if summary is None:
+            self.thesis_info.configure(text="No manifest.json - run stage 00 first.")
+            self.scan_list.set_items([])
+            return
+        ids = summary["usable_ids"]
+        ready = [i for i in ids if (config.dir_native / f"{i}.nii.gz").exists()]
+        self.scan_list.set_items(ready, checked=False)
+        missing = len(ids) - len(ready)
+        self.thesis_info.configure(
+            text=f"{len(ready)} usable scans with a native series"
+                 + (f"; {missing} still need stage 01" if missing else ""))
+        if not self.outdir.get():
+            self.outdir.var.set(str(config.dir_pvc))
+
+    # ================================================================ #
+    # Parameters -> settings
+    # ================================================================ #
     def _iteration_list(self) -> list[int]:
         if not self.sweep_on.get():
             return [self.iterations.as_int(15)]
-        counts = []
-        for part in self.sweep_values.get().replace(";", ",").split(","):
-            part = part.strip()
-            if part:
-                counts.append(int(float(part)))
+        counts = [int(float(p)) for p in self.sweep_values.get().replace(";", ",").split(",") if p.strip()]
         return counts or [self.iterations.as_int(15)]
 
-    # ---------------------------------------------------------------- #
-    # Run
-    # ---------------------------------------------------------------- #
+    def _scan_pairs(self) -> list[tuple[str, Path]]:
+        """``(scan_id, path)`` pairs for whichever input mode is active."""
+        if self.mode.get() == "files":
+            pairs = []
+            for path in self.inputs.paths():
+                scan_id = path.name.replace(".nii.gz", "").replace(".nii", "")
+                pairs.append((scan_id, path))
+            return pairs
+        config = self._config()
+        if config is None:
+            return []
+        return [(scan_id, config.dir_native / f"{scan_id}.nii.gz") for scan_id in self.scan_list.selected()]
+
+    # ================================================================ #
+    # Run / stop
+    # ================================================================ #
     def _run(self) -> None:
-        files = self.inputs.paths()
+        pairs = self._scan_pairs()
         out_dir = self.outdir.path()
-        if not files:
-            messagebox.showwarning("No input", "Pick at least one image.")
+        methods = [m for m, on in (("RL", self.use_rl.get()), ("RVC", self.use_rvc.get())) if on]
+        if not pairs:
+            messagebox.showwarning("No input", "Pick at least one image or scan.")
+            return
+        if not methods:
+            messagebox.showwarning("No method", "Tick RL, RVC or both.")
             return
         if out_dir is None:
             messagebox.showwarning("No output folder", "Pick where the results should go.")
             return
-        out_dir.mkdir(parents=True, exist_ok=True)
+        missing = [str(p) for _, p in pairs if not p.exists()]
+        if missing:
+            messagebox.showerror("Missing input", "Not found:\n" + "\n".join(missing[:8]))
+            return
 
         counts = self._iteration_list()
-        total = len(files) * len(counts)
-        self.progress.configure(maximum=total, value=0)
-        self.log.clear()
-        self._set_running(True)
+        backend = "numpy" if self.backend.get().startswith("numpy") else "petpvc"
+        config = self._config()
+        executable = config.petpvc_exe if config is not None else None
 
-        settings = dict(
-            method=self.method.get(),
+        params = dict(
+            methods=methods, counts=counts,
             alpha=self.alpha.as_float(1.5),
             fwhm=tuple(entry.as_float(d) for entry, d in zip(self.fwhm, DEFAULT_FWHM)),
-            disable_stopping=self.no_stop.get(),
-            backend=self.backend.get(),
-            workers=max(1, self.workers.as_int(1)),
+            backend=backend, executable=executable,
+            workers=max(1, self.workers.as_int(1)), resume=self.resume.get(),
         )
 
-        self.job = ThreadJob(self._on_line, self._on_done, self)
-        self.job.start(lambda log: _correct_all(files, out_dir, counts, settings, log,
-                                                self.job.cancelled if self.job else False,
-                                                should_stop=lambda: bool(self.job and self.job.cancelled)))
+        self.stop_event.clear()
+        self._n_scans = len(pairs)
+        self._n_settings = len(methods) * len(counts)
+        self.progress.configure(maximum=self._n_scans * self._n_settings, value=0)
+        self.log.clear()
+        self._set_running(True)
+        self._processed_ids = [scan_id for scan_id, _ in pairs]
+        self._out_dir = out_dir
 
-    def _cancel(self) -> None:
-        if self.job:
-            self.job.cancel()
-            self.status.configure(text="cancelling…")
+        self.job = ThreadJob(self._on_line, self._on_done, self)
+        self.job.start(lambda log: _run_batch_job(pairs, out_dir, params, log, self.stop_event),
+                       capture_logger="pvc_dlif")
+
+    def _stop(self) -> None:
+        self.stop_event.set()
+        self.status.configure(text="stopping after this scan…")
 
     def _on_line(self, line: str) -> None:
         if line.startswith("__progress__"):
             self.progress.step(1)
+            done = int(self.progress["value"])
+            scan = min(self._n_scans, done // max(1, self._n_settings) + 1)
+            self.status.configure(text=f"scan {scan} of {self._n_scans}")
             return
+        if "frames" in line and "/" in line:
+            # "INFO   AA1 rl_i15: 20/42 frames" -> frame progress in the status label
+            try:
+                fragment = line.split(":")[-1].strip().split()[0]
+                current = self.status.cget("text").split(",")[0]
+                self.status.configure(text=f"{current}, frame {fragment}")
+            except (IndexError, ValueError):
+                pass
         self.log.write(line)
 
     def _on_done(self, ok: bool) -> None:
         self._set_running(False)
-        self.status.configure(text="done" if ok else "failed")
-        self.log.write("Finished." if ok else "Finished with errors.", "ok" if ok else "error")
+        stopped = self.stop_event.is_set()
+        self.status.configure(text="stopped" if stopped else ("done" if ok else "failed"))
+        self.log.write("Stopped at a scan boundary." if stopped else
+                       ("Finished." if ok else "Finished with errors."),
+                       "warn" if stopped else ("ok" if ok else "error"))
+        self._show_results()
 
     def _set_running(self, running: bool) -> None:
         self.run_button.configure(state="disabled" if running else "normal")
-        self.cancel_button.configure(state="normal" if running else "disabled")
-        self.status.configure(text="running…" if running else "idle")
+        self.stop_button.configure(state="normal" if running else "disabled")
+        if running:
+            self.status.configure(text="starting…")
 
-
-# -------------------------------------------------------------------- #
-# The actual work - a plain function, so it is testable without any GUI.
-# -------------------------------------------------------------------- #
-def _correct_all(files, out_dir: Path, counts, settings: dict, log, _unused=False,
-                 should_stop=lambda: False) -> None:
-    """Correct every (file, iteration count) pair, writing a NIfTI and a sidecar."""
-    import numpy as np
-    import nibabel as nib
-
-    from pvc_dlif.pvc.deconvolution import PVCSettings, make_backend
-    from pvc_dlif.pvc.psf import PSF
-
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    psf = PSF(tuple(settings["fwhm"]))
-    backend = make_backend(settings["backend"])
-    log(f"Backend: {backend.name}   PSF FWHM: {psf.fwhm_mm} mm")
-
-    for path in files:
-        if should_stop():
-            log("cancelled")
+    # ================================================================ #
+    # Results
+    # ================================================================ #
+    def _show_results(self) -> None:
+        """Summarise the diagnostics JSONs for the scans that were just processed."""
+        try:
+            import pandas as pd
+            from pvc_dlif.report.assemble import frame_diagnostics_table
+        except ImportError:
             return
-        image = nib.load(str(path))
-        data = np.asarray(image.dataobj, dtype=np.float32)
-        zooms = [float(z) for z in image.header.get_zooms()[:3]]
-        is_4d = data.ndim == 4
+        frames = frame_diagnostics_table(self._out_dir)
+        if frames.empty:
+            return
+        frames = frames[frames["scan_id"].isin(self._processed_ids)]
+        if frames.empty:
+            return
+        summary = (frames.groupby(["scan_id", "tag"])
+                   .agg(frames=("frame", "count"),
+                        noise_amplification=("noise_amplification", "median"),
+                        peak_recovery=("peak_recovery", "median"),
+                        negative_fraction=("negative_fraction_after", "mean"))
+                   .reset_index())
+        self.results.show(summary)
+        self.frames_table.show(frames)
+        self.panes.select(self.results)
+        del pd
 
-        sampling = psf.fwhm_voxels(zooms)
-        log(f"\n{path.name}: shape {data.shape}, voxel {tuple(round(z, 4) for z in zooms)} mm, "
-            f"FWHM {tuple(round(s, 2) for s in sampling)} voxels")
-        for warning in psf.check_sampling(zooms, path.stem):
-            log("WARNING: " + warning)
 
-        for iterations in counts:
-            if should_stop():
-                log("cancelled")
-                return
-            pvc = PVCSettings(method=settings["method"], iterations=iterations, psf=psf,
-                              alpha=settings["alpha"],
-                              disable_stopping_criterion=settings["disable_stopping"])
-            log(f"  {pvc.tag} …")
+# ==================================================================== #
+# The work itself - a plain function so it is testable without a window
+# ==================================================================== #
+def _run_batch_job(pairs, out_dir: Path, params: dict, log, stop_event) -> dict:
+    """Build the settings list and hand everything to ``run_batch``.
 
-            if is_4d:
-                # NIfTI is (x, y, z, t); the backend wants one volume at a time.
-                corrected = np.empty_like(data)
-                for t in range(data.shape[3]):
-                    corrected[..., t] = backend.correct_volume(data[..., t], zooms, pvc)
-            else:
-                corrected = backend.correct_volume(data, zooms, pvc)
+    Returns the report ``run_batch`` produced.  Progress ticks are sent as the
+    literal line ``__progress__`` which the tab turns into a bar step.
+    """
+    from pvc_dlif.pvc.deconvolution import PVCSettings
+    from pvc_dlif.pvc.psf import PSF
+    from pvc_dlif.pvc.runner import run_batch
 
-            stem = path.name.replace(".nii.gz", "").replace(".nii", "")
-            target = out_dir / f"{stem}_{pvc.tag}.nii.gz"
-            nib.save(nib.Nifti1Image(corrected.astype(np.float32), image.affine, image.header),
-                     str(target))
+    psf = PSF(tuple(params["fwhm"]))
+    settings = [PVCSettings(method=m, iterations=k, psf=psf, alpha=params["alpha"])
+                for m in params["methods"] for k in params["counts"]]
+    log(f"{len(pairs)} scan(s) x {len(settings)} setting(s): "
+        + ", ".join(s.tag for s in settings) + f"   PSF {psf.fwhm_mm} mm   backend {params['backend']}")
 
-            # Sidecar: what was run, on what, when.
-            target.with_suffix("").with_suffix(".pvc.json").write_text(json.dumps({
-                "source": str(path),
-                "method": pvc.method,
-                "iterations": pvc.iterations,
-                "alpha": pvc.alpha,
-                "psf_fwhm_mm": list(psf.fwhm_mm),
-                "disable_stopping_criterion": pvc.disable_stopping_criterion,
-                "backend": backend.name,
-                "voxel_mm": zooms,
-                "created": datetime.now().isoformat(timespec="seconds"),
-            }, indent=2), encoding="utf-8")
-
-            ratio = float(corrected.max() / data.max()) if data.max() > 0 else float("nan")
-            log(f"    -> {target.name}   peak x{ratio:.3f}")
+    report = {"written": [], "skipped": [], "failed": [], "warnings": [], "stopped": False}
+    # One scan per call so progress can be reported between scans; run_batch
+    # itself handles the settings loop, resume and diagnostics for that scan.
+    for index, (scan_id, path) in enumerate(pairs, start=1):
+        if stop_event.is_set():
+            report["stopped"] = True
+            break
+        log(f"--- scan {index} of {len(pairs)}: {scan_id}")
+        partial = run_batch([(scan_id, path)], settings, out_dir,
+                            backend_name=params["backend"], executable=params["executable"],
+                            workers=params["workers"], resume=params["resume"],
+                            should_stop=stop_event.is_set)
+        for key in ("written", "skipped", "failed", "warnings"):
+            report[key].extend(partial[key])
+        for _ in settings:
             log("__progress__")
+        if partial["failed"]:
+            for failure in partial["failed"]:
+                log(f"ERROR {failure['scan_id']} {failure['settings']}: {failure['error']}")
+
+    log(f"written {len(report['written'])}, skipped {len(report['skipped'])}, "
+        f"failed {len(report['failed'])}")
+    return report

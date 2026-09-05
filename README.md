@@ -111,12 +111,13 @@ python gui/run_gui.py     # from a clone   (run_gui.bat on Windows)
 pvc-dlif-gui              # once installed
 ```
 
-Three tabs doing exactly what the command line does — **PVC** (correct one image
-or a folder, with method, iterations, alpha and PSF on screen, and a `.pvc.json`
-sidecar recording what produced each output), **Pipeline** (tick the stages,
-watch the output stream, with the command printed so it can be reproduced from a
-terminal), and **Analysis** (load `<work>/results`, read the tables, draw and
-save the plots).
+Four tabs doing exactly what the command line does — **Setup** (paths,
+key parameters, and a preflight check that names what is missing and how to
+fix it), **PVC** (correct one image, a folder, or a set of thesis scans, with
+method, iterations, alpha and PSF on screen), **Pipeline** (the nine stages
+with status read from the work folder, run detached so closing the window does
+not stop them), and **Analysis** (tables, the thesis figures, a per-scan
+browser, and an export for Overleaf).
 
 ## Data
 

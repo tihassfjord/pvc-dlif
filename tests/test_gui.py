@@ -1,24 +1,25 @@
-"""Tests for the GUI's non-interactive parts.
+"""Tests for the GUI's worker functions.
 
 The widgets themselves are not tested - clicking buttons in CI is not worth the
-machinery.  What is tested is the code that does work: the PVC worker function
-and the pipeline tab's command building, both of which are plain functions
-deliberately kept free of widget references.
+machinery.  What is tested is the code that does work: the PVC tab's batch
+worker and the pipeline tab's command building, both plain functions kept
+free of widget references.  The library modules the GUI sits on are covered in
+``test_gui_support.py`` without needing tkinter at all.
 
-Skipped entirely where tkinter is unavailable (headless containers, some conda
-builds), because the modules import it at the top level.
+Skipped where tkinter is unavailable (headless containers, some conda builds),
+because the tab modules import it at the top level.
 """
 
 from __future__ import annotations
 
-import json
 import sys
+import threading
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-pytest.importorskip("tkinter", reason="GUI modules import tkinter at module level")
+pytest.importorskip("tkinter", reason="GUI tab modules import tkinter at module level")
 nib = pytest.importorskip("nibabel")
 
 GUI_DIR = Path(__file__).resolve().parents[1] / "gui"
@@ -26,80 +27,71 @@ if str(GUI_DIR) not in sys.path:
     sys.path.insert(0, str(GUI_DIR))
 
 
-def _write_blurred_sphere(path: Path, frames: int | None = None) -> None:
-    """A hot sphere, Gaussian-blurred - something deconvolution can act on."""
+def _write_blurred_sphere(path: Path, frames: int = 3) -> None:
+    """A 4D series of a hot sphere, Gaussian-blurred - something to deconvolve."""
     from scipy.ndimage import gaussian_filter
 
     grid = np.zeros((24, 24, 24), np.float32)
     z, y, x = np.ogrid[:24, :24, :24]
     grid[((z - 12) ** 2 + (y - 12) ** 2 + (x - 12) ** 2) < 9] = 100.0
     blurred = gaussian_filter(grid, 1.2).astype(np.float32)
-    data = (np.stack([blurred * s for s in np.linspace(1.0, 0.4, frames)], axis=-1)
-            if frames else blurred)
+    data = np.stack([blurred * s for s in np.linspace(1.0, 0.4, frames)], axis=-1)
     nib.save(nib.Nifti1Image(data, np.diag([0.5, 0.5, 0.6, 1])), str(path))
 
 
-SETTINGS = dict(method="RL", alpha=1.5, fwhm=(0.864, 0.874, 0.994),
-                disable_stopping=True, backend="numpy", workers=1)
+PARAMS = dict(methods=["RL"], counts=[5], alpha=1.5, fwhm=(0.864, 0.874, 0.994),
+              backend="numpy", executable=None, workers=1, resume=True)
 
 
-def test_worker_corrects_3d_and_4d_and_writes_sidecars(tmp_path):
-    """One 3D volume and one 4D series, two iteration counts, in one call."""
-    from pvc_dlif_gui.tab_pvc import _correct_all
+def test_worker_runs_through_run_batch_and_writes_diagnostics(tmp_path):
+    from pvc_dlif_gui.tab_pvc import _run_batch_job
 
-    _write_blurred_sphere(tmp_path / "vol.nii.gz")
-    _write_blurred_sphere(tmp_path / "series.nii.gz", frames=3)
-
+    for name in ("a", "b"):
+        _write_blurred_sphere(tmp_path / f"{name}.nii.gz")
+    pairs = [("a", tmp_path / "a.nii.gz"), ("b", tmp_path / "b.nii.gz")]
     lines: list[str] = []
-    _correct_all([tmp_path / "vol.nii.gz", tmp_path / "series.nii.gz"],
-                 tmp_path / "out", [5, 10], SETTINGS, lines.append)
+    report = _run_batch_job(pairs, tmp_path / "out", PARAMS, lines.append, threading.Event())
 
-    written = sorted(p.name for p in (tmp_path / "out").iterdir())
-    assert "vol_rl_i5.nii.gz" in written and "series_rl_i10.nii.gz" in written
+    assert len(report["written"]) == 2 and not report["failed"]
+    assert (tmp_path / "out" / "rl_i5" / "a.nii.gz").exists()
+    assert (tmp_path / "out" / "rl_i5" / "a.diagnostics.json").exists()
+    assert lines.count("__progress__") == 2
 
-    # The sidecar is what makes a result traceable; check it is complete.
-    sidecar = json.loads((tmp_path / "out" / "vol_rl_i10.pvc.json").read_text())
-    assert sidecar["method"] == "RL"
-    assert sidecar["iterations"] == 10
-    assert sidecar["psf_fwhm_mm"] == [0.864, 0.874, 0.994]
-    assert sidecar["backend"] == "numpy"
-
-    # The 4D file keeps its fourth dimension.
-    assert nib.load(str(tmp_path / "out" / "series_rl_i5.nii.gz")).shape == (24, 24, 24, 3)
-
-    # One progress tick per (file, iteration count).
-    assert sum(1 for line in lines if line == "__progress__") == 4
+    # Resume: nothing recomputed on a second call
+    report = _run_batch_job(pairs, tmp_path / "out", PARAMS, lines.append, threading.Event())
+    assert len(report["skipped"]) == 2 and not report["written"]
 
 
 def test_worker_recovers_the_peak(tmp_path):
-    """Deconvolution should raise the peak of a blurred sphere, not lower it."""
-    from pvc_dlif_gui.tab_pvc import _correct_all
+    from pvc_dlif_gui.tab_pvc import _run_batch_job
 
-    _write_blurred_sphere(tmp_path / "vol.nii.gz")
-    _correct_all([tmp_path / "vol.nii.gz"], tmp_path / "out", [10], SETTINGS, lambda _l: None)
-
-    before = np.asarray(nib.load(str(tmp_path / "vol.nii.gz")).dataobj)
-    after = np.asarray(nib.load(str(tmp_path / "out" / "vol_rl_i10.nii.gz")).dataobj)
+    _write_blurred_sphere(tmp_path / "a.nii.gz")
+    _run_batch_job([("a", tmp_path / "a.nii.gz")], tmp_path / "out", PARAMS, lambda _l: None,
+                   threading.Event())
+    before = np.asarray(nib.load(str(tmp_path / "a.nii.gz")).dataobj)
+    after = np.asarray(nib.load(str(tmp_path / "out" / "rl_i5" / "a.nii.gz")).dataobj)
     assert after.max() > before.max()
-    assert after.min() >= -1e-6            # RL is non-negative by construction
+    assert after.min() >= -1e-6
 
 
-def test_worker_stops_when_asked(tmp_path):
-    """The cancel check is honoured between files."""
-    from pvc_dlif_gui.tab_pvc import _correct_all
+def test_worker_stops_at_a_scan_boundary(tmp_path):
+    from pvc_dlif_gui.tab_pvc import _run_batch_job
 
-    for name in ("a.nii.gz", "b.nii.gz"):
-        _write_blurred_sphere(tmp_path / name)
+    for name in ("a", "b", "c"):
+        _write_blurred_sphere(tmp_path / f"{name}.nii.gz")
+    pairs = [(n, tmp_path / f"{n}.nii.gz") for n in ("a", "b", "c")]
+    stop = threading.Event()
 
-    lines: list[str] = []
-    _correct_all([tmp_path / "a.nii.gz", tmp_path / "b.nii.gz"], tmp_path / "out",
-                 [5], SETTINGS, lines.append, should_stop=lambda: True)
-    assert "cancelled" in lines
-    assert not (tmp_path / "out").exists() or not list((tmp_path / "out").glob("*.nii.gz"))
+    def log(line: str) -> None:
+        if line.startswith("--- scan 2"):       # ask to stop while scan 2 is announced
+            stop.set()
+
+    report = _run_batch_job(pairs, tmp_path / "out", PARAMS, log, stop)
+    assert report["stopped"]
+    assert len(report["written"]) == 1           # scan 1 completed, 2 and 3 never started
 
 
 def test_pilot_arguments_come_from_run_all():
-    """The GUI's pilot mode must be the same pilot mode as the command line."""
     from pvc_dlif_gui.tab_pipeline import _pilot_args
 
     assert _pilot_args("05") == ["--limit", "8", "--folds", "1", "--runs", "1", "--epochs", "5"]

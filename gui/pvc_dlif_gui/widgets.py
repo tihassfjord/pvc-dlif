@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, ttk
+from tkinter import filedialog, messagebox, ttk
 
 
 class ToolTip:
@@ -158,31 +158,162 @@ class LabelledEntry(ttk.Frame):
 
 
 class TableView(ttk.Frame):
-    """Treeview that displays a pandas DataFrame without needing pandas here."""
+    """Treeview that displays a pandas DataFrame, sortable by clicking a header.
 
-    def __init__(self, parent, height: int = 10):
+    Keeps the frame it was given so sorting and CSV export work on the real
+    values, not on the rounded strings shown in the cells.
+    """
+
+    def __init__(self, parent, height: int = 10, with_export: bool = True):
         super().__init__(parent)
+        self.frame = None
+        self._sort_desc: dict[str, bool] = {}
+
+        if with_export:
+            bar = ttk.Frame(self)
+            bar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 3))
+            ttk.Button(bar, text="Export CSV…", command=self.export_csv).pack(side="right")
+            self.info = ttk.Label(bar, text="", foreground="#666")
+            self.info.pack(side="left")
+        else:
+            self.info = None
+
         self.tree = ttk.Treeview(self, show="headings", height=height)
         vsb = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
         hsb = ttk.Scrollbar(self, orient="horizontal", command=self.tree.xview)
         self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        vsb.grid(row=0, column=1, sticky="ns")
-        hsb.grid(row=1, column=0, sticky="ew")
-        self.rowconfigure(0, weight=1)
+        self.tree.grid(row=1, column=0, sticky="nsew")
+        vsb.grid(row=1, column=1, sticky="ns")
+        hsb.grid(row=2, column=0, sticky="ew")
+        self.rowconfigure(1, weight=1)
         self.columnconfigure(0, weight=1)
 
-    def show(self, frame, max_rows: int = 500, digits: int = 4) -> None:
-        """Replace the contents with the first ``max_rows`` of a DataFrame."""
+    def show(self, frame, max_rows: int = 2000, digits: int = 4) -> None:
+        """Replace the contents with a DataFrame (first ``max_rows`` rows)."""
+        self.frame = frame
+        self._digits = digits
+        self._max_rows = max_rows
+        self._render()
+
+    def _render(self) -> None:
+        frame = self.frame
         self.tree.delete(*self.tree.get_children())
+        if frame is None:
+            return
         columns = [str(c) for c in frame.columns]
         self.tree["columns"] = columns
         for name in columns:
-            self.tree.heading(name, text=name)
+            self.tree.heading(name, text=name, command=lambda c=name: self.sort_by(c))
             self.tree.column(name, width=max(70, min(190, 9 * len(name) + 40)),
                              anchor="center", stretch=False)
-        for _, row in frame.head(max_rows).iterrows():
-            self.tree.insert("", "end", values=[_fmt(v, digits) for v in row])
+        for _, row in frame.head(self._max_rows).iterrows():
+            self.tree.insert("", "end", values=[_fmt(v, self._digits) for v in row])
+        if self.info is not None:
+            shown = min(len(frame), self._max_rows)
+            self.info.configure(text=f"{len(frame)} rows" + (f" (showing {shown})" if shown < len(frame) else ""))
+
+    def sort_by(self, column: str) -> None:
+        """Toggle ascending/descending on a column and redraw."""
+        if self.frame is None:
+            return
+        descending = self._sort_desc.get(column, False)
+        self.frame = self.frame.sort_values(column, ascending=not descending, kind="mergesort")
+        self._sort_desc[column] = not descending
+        self._render()
+
+    def export_csv(self) -> None:
+        if self.frame is None:
+            messagebox.showinfo("Nothing to export", "Load a table first.")
+            return
+        path = filedialog.asksaveasfilename(defaultextension=".csv",
+                                            filetypes=(("CSV", "*.csv"),))
+        if path:
+            self.frame.to_csv(path, index=False)
+
+
+class Banner(ttk.Frame):
+    """A coloured strip for results that must not be missed.
+
+    ``kind`` is 'ok', 'warn', 'error' or 'info'.  Hidden until :meth:`show`
+    is called; :meth:`hide` removes it again.
+    """
+
+    COLOURS = {
+        "ok": ("#dff0d8", "#3c763d"),
+        "warn": ("#fcf8e3", "#8a6d3b"),
+        "error": ("#f2dede", "#a94442"),
+        "info": ("#d9edf7", "#31708f"),
+    }
+
+    def __init__(self, parent, before=None):
+        super().__init__(parent)
+        self.label = tk.Label(self, anchor="w", justify="left", padx=10, pady=6,
+                              font=("Segoe UI", 10, "bold"), wraplength=900)
+        self.label.pack(fill="x")
+        self._before = before          # widget to pack in front of, if any
+        self._shown = False
+
+    def show(self, text: str, kind: str = "info") -> None:
+        background, foreground = self.COLOURS.get(kind, self.COLOURS["info"])
+        self.label.configure(text=text, background=background, foreground=foreground)
+        if not self._shown:
+            if self._before is not None:
+                self.pack(fill="x", pady=(6, 0), before=self._before)
+            else:
+                self.pack(fill="x", pady=(6, 0))
+            self._shown = True
+
+    def hide(self) -> None:
+        if self._shown:
+            self.pack_forget()
+            self._shown = False
+
+
+class CheckList(ttk.Frame):
+    """Scrollable list of check boxes with select-all / none buttons."""
+
+    def __init__(self, parent, height: int = 10, columns: int = 4):
+        super().__init__(parent)
+        self.columns = columns
+        self.vars: dict[str, tk.BooleanVar] = {}
+
+        bar = ttk.Frame(self)
+        bar.pack(fill="x")
+        ttk.Button(bar, text="All", width=6, command=lambda: self.set_all(True)).pack(side="left")
+        ttk.Button(bar, text="None", width=6, command=lambda: self.set_all(False)).pack(side="left", padx=4)
+        self.count = ttk.Label(bar, text="")
+        self.count.pack(side="left", padx=8)
+
+        canvas = tk.Canvas(self, height=height * 22, highlightthickness=0)
+        bar_y = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
+        self.inner = ttk.Frame(canvas)
+        self.inner.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        canvas.configure(yscrollcommand=bar_y.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        bar_y.pack(side="right", fill="y")
+
+    def set_items(self, items: list[str], checked: bool = True) -> None:
+        for child in self.inner.winfo_children():
+            child.destroy()
+        self.vars.clear()
+        for index, item in enumerate(items):
+            var = tk.BooleanVar(value=checked)
+            var.trace_add("write", lambda *_: self._update_count())
+            self.vars[item] = var
+            ttk.Checkbutton(self.inner, text=item, variable=var).grid(
+                row=index // self.columns, column=index % self.columns, sticky="w", padx=6)
+        self._update_count()
+
+    def set_all(self, value: bool) -> None:
+        for var in self.vars.values():
+            var.set(value)
+
+    def selected(self) -> list[str]:
+        return [item for item, var in self.vars.items() if var.get()]
+
+    def _update_count(self) -> None:
+        self.count.configure(text=f"{len(self.selected())} of {len(self.vars)} selected")
 
 
 def _fmt(value, digits: int) -> str:

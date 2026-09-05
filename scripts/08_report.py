@@ -14,14 +14,12 @@ import json
 import sys
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 from _common import base_parser, start
 
-from pvc_dlif.data import pkl_io
 from pvc_dlif.logging_utils import get_logger, write_provenance
-from pvc_dlif.report import figures, tables
+from pvc_dlif.report import assemble, figures, tables
 
 LOGGER = get_logger("stage.report")
 
@@ -90,29 +88,9 @@ def main() -> int:
         written += [str(p) for p in figures.save_figure(fig, report_dir / "error_by_time_bin", formats)]
 
     # -- recovery-noise trade-off from the PVC diagnostics ---------------- #
-    diagnostics_rows: list[dict] = []
-    for diag_path in sorted(config.dir_pvc.rglob("*.diagnostics.json")):
-        payload = json.loads(diag_path.read_text(encoding="utf-8"))
-        tag = diag_path.parent.name
-        for row in payload.get("frames", []):
-            noise_before = row.get("noise_pct_std_before") or np.nan
-            peak_before = row.get("blood_peak_before") or np.nan
-            diagnostics_rows.append(
-                {
-                    "tag": tag,
-                    "scan_id": payload.get("scan_id"),
-                    "frame": row.get("frame"),
-                    "counts_proxy": row.get("counts_proxy"),
-                    "noise_amplification": (
-                        row.get("noise_pct_std_after") / noise_before if noise_before else np.nan
-                    ),
-                    "peak_recovery": (
-                        row.get("blood_peak_after") / peak_before if peak_before else np.nan
-                    ),
-                }
-            )
-    if diagnostics_rows:
-        diag_frame = pd.DataFrame(diagnostics_rows)
+    # Assembled by the shared helper so the GUI draws exactly the same figure.
+    diag_frame = assemble.frame_diagnostics_table(config.dir_pvc)
+    if len(diag_frame):
         diag_frame.to_csv(results / "pvc_frame_diagnostics.csv", index=False)
         for tag, group in diag_frame.groupby("tag"):
             fig = figures.plot_recovery_noise(
@@ -123,34 +101,16 @@ def main() -> int:
             )]
 
     # -- iteration sweep --------------------------------------------------- #
-    sweep_rows: list[dict] = []
-    for condition in metrics["condition"].unique():
-        matched = [c for c in config.conditions if c.name == condition]
-        if not matched or matched[0].pvc_method is None:
-            continue
-        subset = metrics[metrics["condition"] == condition]
-        sweep_rows.append(
-            {
-                "method": matched[0].pvc_method,
-                "iterations": matched[0].pvc_iterations,
-                "condition": condition,
-                "rmse": float(subset["rmse"].median()),
-            }
-        )
-    if len({r["iterations"] for r in sweep_rows}) > 1:
+    sweep = assemble.iteration_sweep_table(metrics, config.conditions, metric="rmse")
+    if sweep["iterations"].nunique() > 1:
         fig = figures.plot_iteration_sweep(
-            pd.DataFrame(sweep_rows), metric="rmse",
+            sweep, metric="rmse",
             title="Sensitivity of the result to the deconvolution iteration count",
         )
         written += [str(p) for p in figures.save_figure(fig, report_dir / "iteration_sweep", formats)]
 
     # -- curve overlays for example scans ---------------------------------- #
-    predictions_path = config.dir_predictions / "pretrained.parquet"
-    predictions = None
-    if predictions_path.exists():
-        predictions = pd.read_parquet(predictions_path)
-    elif predictions_path.with_suffix(".csv").exists():
-        predictions = pd.read_csv(predictions_path.with_suffix(".csv"))
+    predictions = assemble.load_predictions(config.dir_predictions)
 
     if predictions is not None:
         reference_metrics = metrics[metrics["condition"] == reference].sort_values("rmse")
@@ -166,16 +126,7 @@ def main() -> int:
             examples = reference_metrics["scan_id"].tolist()
 
         for scan_id in examples:
-            subset = predictions[predictions["scan_id"] == scan_id]
-            if subset.empty:
-                continue
-            curves = {}
-            truth = None
-            for condition, group in subset.groupby("condition"):
-                group = group.sort_values("frame")
-                curves[condition] = (group["time_min"].to_numpy(), group["predicted"].to_numpy())
-                if truth is None:
-                    truth = (group["time_min"].to_numpy(), group["truth"].to_numpy())
+            curves, truth = assemble.curves_for_scan(predictions, scan_id)
             if truth is None:
                 continue
             fig = figures.plot_curve_overlay(curves, truth, title=f"Scan {scan_id}")

@@ -54,13 +54,22 @@ class App(tk.Tk):
         from .tab_analysis import AnalysisTab
         from .tab_pipeline import PipelineTab
         from .tab_pvc import PVCTab
+        from .tab_setup import SetupTab
 
-        self.pvc_tab = PVCTab(notebook, self)
+        # Pipeline first: the other tabs read the config path from it.
         self.pipeline_tab = PipelineTab(notebook, self)
+        self.setup_tab = SetupTab(notebook, self)
+        self.pvc_tab = PVCTab(notebook, self)
         self.analysis_tab = AnalysisTab(notebook, self)
+        notebook.add(self.setup_tab, text="  Setup  ")
         notebook.add(self.pvc_tab, text="  PVC  ")
         notebook.add(self.pipeline_tab, text="  Pipeline  ")
         notebook.add(self.analysis_tab, text="  Analysis  ")
+
+        # First launch on a machine with nothing installed: open on Setup so the
+        # preflight is the first thing seen.  Otherwise open on the pipeline.
+        notebook.select(self.setup_tab if _first_run() else self.pipeline_tab)
+        self.notebook = notebook
 
         self.status = ttk.Label(self, relief="sunken", anchor="w", padding=(6, 2),
                                 text=f"repository: {self.repo_root}   |   {_backend_status()}")
@@ -69,12 +78,19 @@ class App(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._close)
 
     def _close(self) -> None:
-        """Warn before quitting while something is still running."""
-        busy = [name for name, tab in (("PVC", self.pvc_tab), ("Pipeline", self.pipeline_tab))
-                if getattr(tab, "job", None) is not None and tab.job.running]   # type: ignore[union-attr]
-        if busy and not messagebox.askyesno(
-                "Still running", f"{', '.join(busy)} still running. Quit anyway?"):
-            return
+        """Warn before quitting while a PVC job is running.
+
+        Pipeline stages are detached and keep running after the window closes
+        - that is the point - so they are mentioned, not blocked on.
+        """
+        if self.pvc_tab.job is not None and self.pvc_tab.job.running:
+            if not messagebox.askyesno("Still running", "A PVC job is running and would be killed. Quit anyway?"):
+                return
+        if self.pipeline_tab.state is not None:
+            messagebox.showinfo(
+                "Stage keeps running",
+                f"Stage {self.pipeline_tab.state['stage']} continues in the background. "
+                "Reopen the GUI to re-attach to it.")
         self.destroy()
 
 
@@ -83,6 +99,13 @@ def _ensure_package_importable(repo_root: Path) -> None:
     src = repo_root / "src"
     if src.is_dir() and str(src) not in sys.path:
         sys.path.insert(0, str(src))
+
+
+def _first_run() -> bool:
+    """No PETPVC on PATH and no torch: the preflight page is the useful start."""
+    import importlib.util
+    import shutil
+    return shutil.which("petpvc") is None and importlib.util.find_spec("torch") is None
 
 
 def _backend_status() -> str:

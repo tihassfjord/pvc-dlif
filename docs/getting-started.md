@@ -24,7 +24,7 @@ Check three things before going further:
 ```bash
 petpvc --help                          # the toolbox is on PATH
 python -c "import torch; print(torch.cuda.is_available())"
-python -m pytest tests/                # 85 tests, no dataset needed
+python -m pytest tests/                # ~100 tests, no dataset needed
 ```
 
 `petpvc` missing is not fatal — the pipeline falls back to a NumPy
@@ -124,20 +124,38 @@ down when you need an answer sooner, at the cost of the variance estimate.
 ## 5. Or use the GUI
 
 ```bash
-python gui/run_gui.py        # from a clone
+python gui/run_gui.py        # from a clone      (run_gui.bat on Windows)
 pvc-dlif-gui                 # once installed
 ```
 
-Three tabs, doing exactly what the command line does:
+Four tabs. Nothing in them contains science — every button calls the same
+library function or stage script the command line does.
 
-- **PVC** — correct one image or a folder of them, with method, iteration
-  count, alpha and PSF on screen. Every output gets a `.pvc.json` sidecar
-  recording the settings that produced it.
-- **Pipeline** — tick the stages to run, point at a config, watch the output
-  stream. The command it runs is printed, so anything done here can be
-  reproduced from a terminal.
-- **Analysis** — load `<work>/results`, read the tables, draw the plots, save
-  any figure at 300 dpi.
+**Setup** — the four paths and the handful of parameters worth changing
+without opening the YAML (primary iteration count, methods, folds, runs,
+device, motion-affected IDs). Saving keeps every comment in the file and
+refuses an edit that would not load. *Run preflight check* tells you, item by
+item, what is installed and what is not, with the exact fix for each — on a
+fresh machine this is where you find out PETPVC is missing.
+
+**PVC** — correct one image, a folder, or a set of thesis scans ticked from
+the manifest. Method, iterations (or a sweep), alpha, PSF, backend and workers
+are on screen. Runs through the same `run_batch` stage 02 uses, so outputs are
+resumable and land in the same layout, with a diagnostics JSON beside each.
+Stop halts at the next scan boundary. The Results tab shows per-scan recovery
+and noise amplification; Per frame shows every frame.
+
+**Pipeline** — the nine stages with a status light and a count read from the
+work folder every time, so it survives a crash or a stage run from a terminal.
+Two banners you cannot miss: *n usable* after stage 00, and the crop agreement
+*r* after stage 01. Stages run *detached*: closing the window does not stop
+them, and reopening the GUI re-attaches to the log and continues the queue.
+
+**Analysis** — load `<work>/results`: the headline summary, every table
+(sortable, exportable), the thesis figures drawn by the same functions stage
+08 uses, and a per-scan browser (sort worst-first to find the cases worth
+writing about). *Export for thesis* copies the figures and LaTeX fragments to
+a folder ready for Overleaf.
 
 ---
 
