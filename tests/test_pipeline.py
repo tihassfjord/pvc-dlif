@@ -415,6 +415,15 @@ class TestFolds:
         assert sorted(test_ids) == sorted(ids)
         assert len(set(test_ids)) == len(ids)
 
+    def test_folds_round_trip_through_json(self, tmp_path):
+        """Stage 06 must score with the folds stage 05 trained on."""
+        import json
+        from pvc_dlif.dlif.dataset import load_folds
+        folds = make_folds([f"S{i}" for i in range(12)], 3, seed=7)
+        path = tmp_path / "folds.json"
+        path.write_text(json.dumps([f.as_dict() for f in folds]))
+        assert load_folds(path) == folds
+
     def test_folds_are_numbered_from_one(self):
         """The group's convention, and what ``--folds`` on stage 05 expects.
         ``--folds 0`` once selected nothing and reported success."""

@@ -97,6 +97,19 @@ def main() -> int:
     if args.limit:
         base_ids = base_ids[: args.limit]
 
+    if len(base_ids) < n_folds:
+        # Only reachable with --limit/--ids: a pilot on fewer scans than folds.
+        # Clamp rather than fail, and say so - these are not the study's folds.
+        LOGGER.warning(
+            "%d scans selected but dlif.cv.n_folds is %d; using %d folds for this run. "
+            "A reduced scan set gives a different partition from the full study, so this "
+            "is only meaningful as a wiring check.",
+            len(base_ids), n_folds, len(base_ids),
+        )
+        n_folds = len(base_ids)
+    if n_folds < 2:
+        raise SystemExit(f"need at least 2 scans for cross-validation, got {len(base_ids)}")
+
     all_folds = make_folds(base_ids, n_folds, config.seed)
     folds = [f for f in all_folds if args.folds is None or f.index in set(args.folds)]
     if not folds:

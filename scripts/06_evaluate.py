@@ -31,7 +31,7 @@ from _common import base_parser, start
 from pvc_dlif.data import pkl_io
 from pvc_dlif.data.manifest import load_manifest
 from pvc_dlif.dlif.adapter import DlifRepo, build_model
-from pvc_dlif.dlif.dataset import make_folds
+from pvc_dlif.dlif.dataset import load_folds, make_folds
 from pvc_dlif.dlif.infer import predict_retrained, predictions_to_frame, save_predictions
 from pvc_dlif.eval.bias_variance import decompose_by_condition, decompose_frame
 from pvc_dlif.eval.curve_metrics import metrics_frame
@@ -92,7 +92,7 @@ def main() -> int:
         if retrained is None:
             repo = DlifRepo(config.dlif_repo)
             base_ids = [e.scan_id for e in manifest if e.usable]
-            folds = make_folds(base_ids, int(config.get("dlif.cv.n_folds", 10)), config.seed)
+            default_folds = make_folds(base_ids, int(config.get("dlif.cv.n_folds", 10)), config.seed)
 
             def model_factory():
                 return build_model(repo, config.retrain_model_name, config.retrain_in_channels)
@@ -106,6 +106,18 @@ def main() -> int:
                 if not checkpoint_root.exists() or not data_root.exists():
                     LOGGER.warning("%s: missing checkpoints or inputs; skipping", condition.name)
                     continue
+                # Score with the partition the checkpoints were trained on.
+                folds_file = checkpoint_root / "folds.json"
+                if folds_file.exists():
+                    folds = load_folds(folds_file)
+                    if [f.test_ids for f in folds] != [f.test_ids for f in default_folds]:
+                        LOGGER.warning(
+                            "%s was trained on a different partition than the full study "
+                            "(%d folds over %d scans) - fine for a pilot, not for results",
+                            condition.name, len(folds), sum(len(f.test_ids) for f in folds),
+                        )
+                else:
+                    folds = default_folds
                 collected.extend(
                     predict_retrained(
                         model_factory=model_factory,

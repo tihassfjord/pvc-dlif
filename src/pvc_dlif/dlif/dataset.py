@@ -26,7 +26,7 @@ from ..data import pkl_io
 
 LOGGER = get_logger(__name__)
 
-__all__ = ["DlifDataset", "Fold", "make_folds", "stratified_val_split", "WeightedMSELoss"]
+__all__ = ["DlifDataset", "Fold", "make_folds", "load_folds", "stratified_val_split", "WeightedMSELoss"]
 
 
 @dataclass(frozen=True)
@@ -39,6 +39,26 @@ class Fold:
 
     def as_dict(self) -> dict[str, Any]:
         return {"fold": self.index, "train_ids": list(self.train_ids), "test_ids": list(self.test_ids)}
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "Fold":
+        return cls(index=int(payload["fold"]), train_ids=tuple(payload["train_ids"]),
+                   test_ids=tuple(payload["test_ids"]))
+
+
+def load_folds(path) -> list[Fold]:
+    """Read the ``folds.json`` stage 05 writes beside its checkpoints.
+
+    Evaluation must use the partition the models were *trained* with, not a
+    recomputed one - the two differ whenever the scan set differed (a pilot
+    with --limit, say), and a mismatch would score held-out predictions from
+    the wrong model.
+    """
+    import json
+    from pathlib import Path as _Path
+
+    payload = json.loads(_Path(path).read_text(encoding="utf-8"))
+    return [Fold.from_dict(row) for row in payload]
 
 
 def make_folds(scan_ids: Sequence[str], n_folds: int = 10, seed: int = 42) -> list[Fold]:
