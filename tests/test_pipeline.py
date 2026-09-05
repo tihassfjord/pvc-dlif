@@ -415,6 +415,19 @@ class TestFolds:
         assert sorted(test_ids) == sorted(ids)
         assert len(set(test_ids)) == len(ids)
 
+    def test_incomplete_runs_are_not_reused(self, tmp_path):
+        """A 5-epoch pilot checkpoint must not pass for a 1000-epoch run."""
+        import json
+        from pvc_dlif.dlif.train import TrainSettings, _run_is_complete
+        summary = tmp_path / "summary.json"
+        summary.write_text(json.dumps({"epochs_trained": 5}))
+        assert _run_is_complete(summary, TrainSettings(epochs=1000)) == (False, "incomplete (5 of 1000 epochs)")
+        summary.write_text(json.dumps({"epochs_trained": 1000}))
+        assert _run_is_complete(summary, TrainSettings(epochs=1000))[0] is True
+        # Early stopping past min_epochs is a legitimate short run
+        summary.write_text(json.dumps({"epochs_trained": 60}))
+        assert _run_is_complete(summary, TrainSettings(epochs=1000, early_stopping=True, min_epochs=20))[0] is True
+
     def test_folds_round_trip_through_json(self, tmp_path):
         """Stage 06 must score with the folds stage 05 trained on."""
         import json

@@ -69,6 +69,10 @@ def main() -> int:
     parser.add_argument("--skip-retrained", action="store_true",
                         help="score only the pretrained predictions")
     parser.add_argument("--skip-kinetics", action="store_true")
+    parser.add_argument("--reuse-predictions", action="store_true",
+                        help="reuse predictions/retrained.* instead of re-predicting from the "
+                             "checkpoints (default re-predicts: a pilot's table must not leak "
+                             "into the real evaluation)")
     args = parser.parse_args()
     config = start(args, "06_evaluate")
 
@@ -88,7 +92,7 @@ def main() -> int:
 
     if not args.skip_retrained:
         retrained_path = config.dir_predictions / "retrained.parquet"
-        retrained = _read_table(retrained_path)
+        retrained = _read_table(retrained_path) if args.reuse_predictions else None
         if retrained is None:
             repo = DlifRepo(config.dlif_repo)
             base_ids = [e.scan_id for e in manifest if e.usable]

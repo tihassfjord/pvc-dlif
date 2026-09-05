@@ -152,6 +152,7 @@ class DlifDataset:
         add_average: bool = False,
         preload: bool = False,
         seed: int = 42,
+        cache: dict | None = None,
     ):
         self.data_root = Path(data_root)
         self.aif_root = Path(aif_root) if aif_root else self.data_root
@@ -163,7 +164,15 @@ class DlifDataset:
         self.random_flip = random_flip
         self.add_average = add_average
         self._rng = np.random.default_rng(seed)
-        self._cache: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        # A cache shared across the datasets of one condition: every scan is
+        # read from disk once per condition, not once per epoch.  A 96x48x48x42
+        # series is 74 MB as the float64 pickle and 37 MB as float32 here, so
+        # the whole 70-scan set is ~2.6 GB in RAM - the same trade the group's
+        # own loader makes with ``preload: True``.  Without it an epoch is
+        # bounded by disk, not the GPU (28 s/epoch was measured on real data).
+        self._cache: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = (
+            cache if cache is not None else {}
+        )
 
         missing = [
             s for s in self.scan_ids
@@ -190,7 +199,11 @@ class DlifDataset:
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         scan_id = self.scan_ids[index]
-        image, aif, times = self._cache.get(scan_id) or self._read(scan_id)
+        cached = self._cache.get(scan_id)
+        if cached is None:
+            cached = self._read(scan_id)
+            self._cache[scan_id] = cached
+        image, aif, times = cached
         image = np.array(image, copy=True)
 
         if self.augment:

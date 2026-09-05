@@ -244,6 +244,7 @@ def train_one_run(
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     started = time.perf_counter()
     epoch = 0
+    progress_path = checkpoint_path.with_name("progress.json")
 
     for epoch in range(settings.epochs):
         train_loss = _epoch(model, train_loader, criterion, device, optimizer, scaler, settings.amp)
@@ -272,9 +273,25 @@ def train_one_run(
                 LOGGER.info("Early stopping at epoch %d (best %d)", epoch, best_epoch)
                 break
 
-        if epoch % 25 == 0 or epoch == settings.epochs - 1:
-            LOGGER.info("  epoch %3d  train %.5f  val %.5f  best %.5f",
-                        epoch, train_loss, val_loss, best_loss)
+        # Heartbeat: a small JSON the GUI and `status.py` read for a live
+        # "epoch e/N, s/epoch, ETA" line, rewritten every epoch.
+        elapsed = time.perf_counter() - started
+        per_epoch = elapsed / (epoch + 1)
+        _write_progress(progress_path, {
+            "epoch": epoch + 1, "epochs": settings.epochs,
+            "train_loss": float(train_loss), "val_loss": float(val_loss),
+            "best_val_loss": float(best_loss), "best_epoch": int(best_epoch),
+            "seconds_per_epoch": per_epoch,
+            "eta_seconds": per_epoch * (settings.epochs - epoch - 1),
+            "updated": time.time(),
+        })
+
+        # Log the first few epochs every time (is it running at all, and how
+        # fast), then every 10th - a run of 1000 epochs should not be silent.
+        if epoch < 3 or (epoch + 1) % 10 == 0 or epoch == settings.epochs - 1:
+            LOGGER.info("  epoch %4d/%d  train %.5f  val %.5f  best %.5f  (%.1f s/epoch, ETA %s)",
+                        epoch + 1, settings.epochs, train_loss, val_loss, best_loss,
+                        per_epoch, _fmt_eta(per_epoch * (settings.epochs - epoch - 1)))
 
     # Restore the best weights so the returned model is the one that is scored.
     payload = torch.load(str(checkpoint_path), map_location=device, weights_only=False)
@@ -288,6 +305,44 @@ def train_one_run(
         "seconds": time.perf_counter() - started,
         "history": history,
     }
+
+
+def _write_progress(path: Path, payload: dict) -> None:
+    """Atomic-enough rewrite of the heartbeat file (write, then rename)."""
+    try:
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        tmp.replace(path)
+    except OSError:                       # never let the heartbeat stop a run
+        pass
+
+
+def _fmt_eta(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    if seconds < 90:
+        return f"{seconds:.0f} s"
+    if seconds < 5400:
+        return f"{seconds / 60:.0f} min"
+    return f"{seconds / 3600:.1f} h"
+
+
+def _run_is_complete(summary_path: Path, settings: "TrainSettings") -> tuple[bool, str]:
+    """Whether an existing run may be reused under the current settings.
+
+    A pilot leaves 5-epoch checkpoints behind; the full run must not accept
+    them as finished.  A run counts as complete when it trained the configured
+    number of epochs, or stopped early under a protocol that allows it.
+    """
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False, "unreadable summary"
+    trained = int(summary.get("epochs_trained", 0))
+    if trained >= settings.epochs:
+        return True, ""
+    if settings.early_stopping and trained >= settings.min_epochs:
+        return True, ""
+    return False, f"incomplete ({trained} of {settings.epochs} epochs)"
 
 
 def train_condition(
@@ -326,17 +381,27 @@ def train_condition(
         json.dumps([f.as_dict() for f in folds], indent=2), encoding="utf-8"
     )
 
+    # One in-memory copy of every scan for this condition, shared by all runs.
+    shared_cache: dict = {}
+
     results: list[RunResult] = []
+    total_jobs = len(folds) * n_runs
+    job = 0
+    trained_jobs, trained_seconds = 0, 0.0        # for the ETA line
     for fold in folds:
         for run in range(1, n_runs + 1):
+            job += 1
             run_dir = out_dir / f"fold_{fold.index:02d}" / f"run_{run:02d}"
             checkpoint = run_dir / "model.pt"
             summary_path = run_dir / "summary.json"
 
             if resume and checkpoint.exists() and summary_path.exists():
-                LOGGER.info("skip fold %d run %d (exists)", fold.index, run)
-                results.append(RunResult(**json.loads(summary_path.read_text(encoding="utf-8"))))
-                continue
+                complete, why = _run_is_complete(summary_path, settings)
+                if complete:
+                    LOGGER.info("skip fold %d run %d (complete)", fold.index, run)
+                    results.append(RunResult(**json.loads(summary_path.read_text(encoding="utf-8"))))
+                    continue
+                LOGGER.warning("fold %d run %d exists but is %s - retraining", fold.index, run, why)
 
             run_seed = seed + 1000 * fold.index + run
             train_ids, val_ids = stratified_val_split(
@@ -348,19 +413,27 @@ def train_condition(
                 poisson_noise=bool(augmentation.get("poisson_noise", True)),
                 random_flip=bool(augmentation.get("random_flip", True)),
                 add_average=bool(augmentation.get("add_average", False)),
-                seed=run_seed,
+                seed=run_seed, cache=shared_cache,
             )
             val_dataset = DlifDataset(
                 data_root, val_ids, aif_root, img_shape, mode="val", augment=False,
                 add_average=bool(augmentation.get("add_average", False)), seed=run_seed,
+                cache=shared_cache,
             )
 
+            eta = ""
+            if trained_jobs:
+                per_job = trained_seconds / trained_jobs
+                eta = f", ETA for this condition {_fmt_eta(per_job * (total_jobs - job + 1))}"
             LOGGER.info(
-                "fold %d/%d run %d/%d -- %d train, %d val, %d test",
-                fold.index, len(folds), run, n_runs, len(train_ids), len(val_ids), len(fold.test_ids),
+                "fold %d/%d run %d/%d (job %d of %d%s) -- %d train, %d val, %d test",
+                fold.index, len(folds), run, n_runs, job, total_jobs, eta,
+                len(train_ids), len(val_ids), len(fold.test_ids),
             )
             model = model_factory()
             model, info = train_one_run(model, train_dataset, val_dataset, settings, checkpoint, run_seed)
+            trained_jobs += 1
+            trained_seconds += float(info["seconds"])
 
             result = RunResult(
                 fold=fold.index,

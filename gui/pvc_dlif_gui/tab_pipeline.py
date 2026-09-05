@@ -327,6 +327,9 @@ class PipelineTab(ttk.Frame):
             if not line.startswith(detached.MARKER):
                 self.log.write(line)
         if detached.pid_alive(int(self.state["pid"])):
+            self._ticks = getattr(self, "_ticks", 0) + 1
+            if self._ticks % 8 == 0:              # ~every 3 s: refresh the heartbeat line
+                self._show_heartbeat()
             self.after(400, self._poll)
             return
 
@@ -349,6 +352,37 @@ class PipelineTab(ttk.Frame):
             self._set_running(False)
             self.status.configure(text="failed")
             self.refresh_status()
+
+    def _show_heartbeat(self) -> None:
+        """Put stage 05's live progress into its detail label and the status."""
+        if self.state is None or self.state.get("stage") != "05":
+            return
+        config = self._config()
+        if config is None:
+            return
+        try:
+            from pvc_dlif.status import training_progress
+            progress = training_progress(config)
+        except Exception:                                   # noqa: BLE001
+            return
+        if not progress:
+            self.detail_labels["05"].configure(text="starting (loading scans into memory)…")
+            return
+        age = progress["age_seconds"]
+        eta = progress.get("eta_seconds", 0.0)
+        eta_text = f"{eta / 60:.0f} min" if eta < 5400 else f"{eta / 3600:.1f} h"
+        line = (f"{progress['condition']} {progress['fold']} {progress['run']}: "
+                f"epoch {progress['epoch']}/{progress['epochs']}, "
+                f"{progress['seconds_per_epoch']:.1f} s/epoch, run ETA {eta_text}, "
+                f"val {progress['val_loss']:.4f} (best {progress['best_val_loss']:.4f})")
+        if progress.get("finished"):
+            line += "  - finished, next run starting"
+        elif age > 10 * max(5.0, progress["seconds_per_epoch"]):
+            line += f"  - NO UPDATE FOR {age / 60:.0f} MIN, may be stuck"
+        else:
+            line += f"  - updated {age:.0f} s ago"
+        self.detail_labels["05"].configure(text=line)
+        self.status.configure(text=f"stage 05 (pid {self.state['pid']}) epoch {progress['epoch']}/{progress['epochs']}")
 
     def _reattach(self) -> None:
         """On startup: is a stage from a previous GUI session still running?"""

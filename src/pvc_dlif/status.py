@@ -17,7 +17,7 @@ from typing import Any
 
 from .config import Config
 
-__all__ = ["StageStatus", "stage_statuses", "manifest_summary", "prepare_summary"]
+__all__ = ["StageStatus", "stage_statuses", "manifest_summary", "prepare_summary", "training_progress"]
 
 
 @dataclass
@@ -88,6 +88,40 @@ def prepare_summary(config: Config) -> dict[str, Any] | None:
                 below.append((scan_id, float(r)))
     summary["scans_below_0999"] = sorted(below, key=lambda item: item[1])
     return summary
+
+
+def training_progress(config: Config) -> dict[str, Any] | None:
+    """The most recently updated ``progress.json`` under models/, with context.
+
+    Stage 05 rewrites one per epoch, so this is the heartbeat: which condition,
+    fold and run is training, how far into its epochs, seconds per epoch, ETA,
+    and how long ago it last wrote - which is how "slow" and "dead" are told
+    apart.
+    """
+    import time
+    newest: Path | None = None
+    newest_mtime = 0.0
+    if not config.dir_models.exists():
+        return None
+    for path in config.dir_models.glob("*/fold_*/run_*/progress.json"):
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if mtime > newest_mtime:
+            newest, newest_mtime = path, mtime
+    if newest is None:
+        return None
+    try:
+        payload = json.loads(newest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    payload["condition"] = newest.parents[2].name
+    payload["fold"] = newest.parents[1].name
+    payload["run"] = newest.parent.name
+    payload["age_seconds"] = max(0.0, time.time() - newest_mtime)
+    payload["finished"] = (newest.parent / "summary.json").exists()
+    return payload
 
 
 # -------------------------------------------------------------------- #

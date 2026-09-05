@@ -23,7 +23,7 @@ from pvc_dlif.config import load_config
 from pvc_dlif.config_edit import save_values, set_value, yaml_scalar
 from pvc_dlif.preflight import disk_estimate_gb, run_checks
 from pvc_dlif.report import assemble
-from pvc_dlif.status import manifest_summary, prepare_summary, stage_statuses
+from pvc_dlif.status import manifest_summary, prepare_summary, stage_statuses, training_progress
 
 REPO = Path(__file__).resolve().parents[1]
 GUI_DIR = REPO / "gui"
@@ -97,6 +97,25 @@ class TestStatus:
         summary = manifest_summary(config)
         assert summary["usable_ids"] == ["A1"]
         assert summary["exclusion_reasons"] == {"ignore_ids": 1, "no arterial curve": 1}
+
+    def test_training_progress_reads_the_newest_heartbeat(self, config_path):
+        """Stage 05 rewrites progress.json every epoch; the GUI shows the newest."""
+        import time
+        config = load_config(config_path)
+        old = config.dir_models / "rl_retrained" / "fold_01" / "run_01"
+        new = config.dir_models / "rl_retrained" / "fold_01" / "run_02"
+        for folder, epoch in ((old, 1000), (new, 137)):
+            folder.mkdir(parents=True)
+            (folder / "progress.json").write_text(json.dumps({
+                "epoch": epoch, "epochs": 1000, "train_loss": 1.0, "val_loss": 2.0,
+                "best_val_loss": 2.0, "best_epoch": 0, "seconds_per_epoch": 1.5,
+                "eta_seconds": 1.5 * (1000 - epoch), "updated": time.time()}))
+        (old / "summary.json").write_text("{}")
+        time.sleep(0.05)
+        (new / "progress.json").touch()                    # newest
+        progress = training_progress(config)
+        assert (progress["condition"], progress["run"], progress["epoch"]) == ("rl_retrained", "run_02", 137)
+        assert progress["finished"] is False and progress["age_seconds"] < 5
 
     def test_prepare_summary_names_scans_below_threshold(self, config_path):
         config = load_config(config_path)

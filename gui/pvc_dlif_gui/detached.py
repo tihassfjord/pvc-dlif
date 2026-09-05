@@ -128,9 +128,13 @@ def launch(command: Sequence[str], work: Path, stage_id: str, cwd: Path | None =
         stdin=subprocess.DEVNULL,
     )
     if sys.platform.startswith("win"):
-        # New process group + no console window: survives the GUI closing.
+        # DETACHED_PROCESS: the child gets no console at all, so closing the
+        # window run_gui.bat opened (or the GUI) cannot take it down with it.
+        # A new process group so Ctrl-C in that console is not delivered here.
+        DETACHED_PROCESS = 0x00000008
         popen_kwargs["creationflags"] = (subprocess.CREATE_NEW_PROCESS_GROUP   # type: ignore[attr-defined]
-                                         | getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                                         | DETACHED_PROCESS)
+        popen_kwargs["close_fds"] = True
     else:
         popen_kwargs["start_new_session"] = True
 
