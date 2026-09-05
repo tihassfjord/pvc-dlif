@@ -33,14 +33,21 @@ from .psf import PSF
 
 LOGGER = get_logger(__name__)
 
-__all__ = ["DeconvolutionBackend", "PetpvcBackend", "NumpyBackend", "make_backend", "PVCSettings"]
+__all__ = ["DeconvolutionBackend", "PetpvcBackend", "NumpyBackend", "make_backend", "PVCSettings",
+           "PETPVC_METHOD_CODE"]
+
+#: What PETPVC calls each method on its command line.  PETPVC's ``VC`` *is*
+#: the reblurred Van Cittert (there is no un-reblurred variant in the toolbox),
+#: so the pipeline's "RVC" - the name used in the thesis and in every output
+#: tag - is passed as ``-p VC``.  Passing "RVC" is an unknown method to PETPVC.
+PETPVC_METHOD_CODE = {"RL": "RL", "RVC": "VC", "VC": "VC"}
 
 
 @dataclass(frozen=True)
 class PVCSettings:
     """Everything that defines one correction, other than the image itself."""
 
-    method: str                 # "RL" or "RVC"
+    method: str                 # "RL" or "RVC" ("VC" is accepted as PETPVC's name for RVC)
     iterations: int
     psf: PSF
     alpha: float = 1.5          # RVC relaxation parameter
@@ -148,7 +155,7 @@ class PetpvcBackend(DeconvolutionBackend):
             self.executable,
             "-i", str(input_path),
             "-o", str(output_path),
-            "-p", settings.method,
+            "-p", PETPVC_METHOD_CODE[settings.method],
             "-x", f"{fx:.6g}",
             "-y", f"{fy:.6g}",
             "-z", f"{fz:.6g}",
@@ -242,12 +249,11 @@ class NumpyBackend(DeconvolutionBackend):
                 estimate = np.maximum(estimate, 0.0)
             return estimate.astype(np.float32)
 
-        # RVC / VC
+        # RVC (PETPVC's "VC"): the residual is reblurred before the additive
+        # update.  Both names run the same algorithm so the two backends agree.
         estimate = image.copy()
         for _ in range(settings.iterations):
-            residual = image - blur(estimate)
-            if settings.method == "RVC":
-                residual = blur(residual)
+            residual = blur(image - blur(estimate))
             estimate = estimate + settings.alpha * residual
         return estimate.astype(np.float32)
 

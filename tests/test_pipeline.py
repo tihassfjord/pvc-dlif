@@ -22,7 +22,7 @@ from pvc_dlif.eval.bias_variance import decompose
 from pvc_dlif.eval.curve_metrics import auc, compute_metrics
 from pvc_dlif.eval.kinetics import patlak
 from pvc_dlif.eval.stats import adjust_pvalues, paired_test, rank_biserial
-from pvc_dlif.pvc.deconvolution import NumpyBackend, PVCSettings
+from pvc_dlif.pvc.deconvolution import PETPVC_METHOD_CODE, NumpyBackend, PetpvcBackend, PVCSettings
 from pvc_dlif.pvc.psf import FWHM_TO_SIGMA, PSF
 
 
@@ -87,6 +87,45 @@ class TestDeconvolution:
         volume = np.zeros((24, 24, 24), dtype=np.float32)
         volume[10:14, 10:14, 10:14] = 10.0
         return volume
+
+    def test_petpvc_command_uses_the_toolbox_method_codes(self, tmp_path):
+        """PETPVC has no 'RVC' method: its reblurred Van Cittert is '-p VC'.
+
+        Sending 'RVC' fails with an unknown-method error on the first scan, so
+        the mapping is pinned here.  RL stays RL.  '-k' is the deconvolution
+        iteration count, '-a' the VC relaxation, '-s 0' disables the stopping
+        criterion so exactly -k iterations run.
+        """
+        backend = PetpvcBackend.__new__(PetpvcBackend)      # skip the PATH lookup
+        backend.executable = "petpvc"
+        psf = PSF((0.864, 0.874, 0.994))
+
+        rvc = backend.build_command(tmp_path / "in.nii", tmp_path / "out.nii",
+                                    PVCSettings("RVC", 15, psf, alpha=1.5))
+        assert rvc[rvc.index("-p") + 1] == "VC"
+        assert rvc[rvc.index("-k") + 1] == "15"
+        assert rvc[rvc.index("-a") + 1] == "1.5"
+        assert rvc[rvc.index("-s") + 1] == "0"
+        assert "RVC" not in rvc
+
+        rl = backend.build_command(tmp_path / "in.nii", tmp_path / "out.nii",
+                                   PVCSettings("RL", 15, psf))
+        assert rl[rl.index("-p") + 1] == "RL"
+        assert "-a" not in rl                                # alpha is a VC parameter
+
+        assert PETPVC_METHOD_CODE == {"RL": "RL", "RVC": "VC", "VC": "VC"}
+
+    def test_output_tags_keep_the_thesis_name(self):
+        """Files and conditions are named rvc_i15, whatever PETPVC calls it."""
+        assert PVCSettings("RVC", 15, PSF((1, 1, 1))).tag == "rvc_i15"
+
+    def test_numpy_vc_and_rvc_are_the_same_algorithm(self):
+        """In PETPVC 'VC' is the reblurred variant, so the fallback must agree."""
+        psf = PSF((2.0, 2.0, 2.0))
+        blurred = psf.blur(self._phantom(), (1.0, 1.0, 1.0))
+        a = NumpyBackend().correct_volume(blurred, (1.0, 1.0, 1.0), PVCSettings("RVC", 5, psf))
+        b = NumpyBackend().correct_volume(blurred, (1.0, 1.0, 1.0), PVCSettings("VC", 5, psf))
+        np.testing.assert_allclose(a, b)
 
     def test_rl_improves_the_recovery_coefficient(self):
         """The phantom metric: mean activity in the object over its true value."""

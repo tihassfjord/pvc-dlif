@@ -276,7 +276,9 @@ Surface these; do not resolve them.
 
 - `methodology.tex` (written, compiles clean, 13 pages) is a drop-in replacement for
   `\chapter{Methodology}`. It fixes a LaTeX error in the existing PSF table
-  (`\textbf{FWHM}_x` — math outside math mode, breaks the build) and corrects `-p VC` → `-p RVC`.
+  (`\textbf{FWHM}_x` — math outside math mode, breaks the build). It says `-p VC` for the
+  reblurred Van Cittert, which is PETPVC's actual method code; an earlier draft wrongly changed
+  it to `-p RVC`, and the backend once sent that too — fixed and pinned by a test.
 - **Abstract still says "approximately 94 scans"** → change to 70.
 - Results / Discussion / Conclusion are placeholders. Once a real run completes they can be
   drafted from `results/summary.json`, `comparisons.csv`, `bias_variance.csv`,
