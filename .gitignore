@@ -1,0 +1,41 @@
+# --- generated output ---------------------------------------------------
+# Everything the pipeline produces goes to the `work` directory configured
+# in configs/*.yaml. Nothing generated belongs in version control.
+thesis_work/
+work/
+*.nii
+*.nii.gz
+*.pkl
+*.parquet
+*.pt
+*.pth
+
+# --- data ---------------------------------------------------------------
+# The mouse dataset and the pretrained DLIF weights are not distributed
+# with this repository. See docs/data.md.
+data/
+dicom/
+
+# --- python -------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# --- editors / OS -------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- local configuration ------------------------------------------------
+# example.yaml is the template that ships; a filled-in config holds real
+# paths to someone's dataset and does not belong in version control.
+configs/thesis.yaml
+configs/synthetic.yaml

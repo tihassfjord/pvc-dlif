@@ -1,0 +1,335 @@
+# =====================================================================
+# pvc-dlif -- configuration template
+#
+# Copy to configs/thesis.yaml and set the four paths below.  Nothing else
+# needs changing for a first run.
+#
+# Originally: ML4PET master thesis (FYS-3941)
+# Partial Volume Correction for Improved Deep-Learning-Derived Input
+# Function Estimation in Preclinical PET Imaging
+#
+# Single source of truth for every stage of the pipeline.
+# Every script reads this file; nothing is hard-coded elsewhere.
+# =====================================================================
+
+project:
+  name: pvc-dlif-thesis
+  seed: 42
+
+# ---------------------------------------------------------------------
+# Paths.  Windows paths are fine; they are normalised on load.
+# Anything under `work` is generated and can be deleted and rebuilt.
+# ---------------------------------------------------------------------
+paths:
+  # Raw multi-frame PMOD/LabPET8 DICOM exports, one file (or dir) per scan,
+  # named dPET_dcm_<ID>.
+  dicom_root:      "/path/to/dynamic/dicom"          # dPET_dcm_<ID> exports
+
+  # The group's preprocessed DLIF data root, containing
+  #   AIF_SUV/AIF_<ID>.pkl, IMG_SUV_96x48x48/IMG_<ID>.pkl, VOI_SUV/VOI_<ID>.pkl
+  dlif_data_root:  "/path/to/dlif/data"              # AIF_SUV/ IMG_SUV_96x48x48/ VOI_SUV/
+
+  # Clone of the group's DLIF repository (the one holding src/models and
+  # src/models/pretrained_weigths/DLIFNet.pt).
+  dlif_repo:       "/path/to/DLIF"                   # the model repo and its weights
+
+  # Everything this pipeline produces.
+  work:            "/path/to/output"                 # everything generated lands here
+
+  # Optional: PETPVC executable.  Left null -> looked up on PATH.
+  petpvc_exe:      null
+  # Optional: FALCON executable (falcon / falconz).  null -> PATH, then fallback.
+  falcon_exe:      null
+
+# ---------------------------------------------------------------------
+# Acquisition geometry and system PSF.
+# FWHM values measured on the LabPET8 point source in the project thesis.
+# Order is (x, y, z) in millimetres, matching NIfTI axis order.
+# ---------------------------------------------------------------------
+psf:
+  fwhm_mm: [0.864, 0.874, 0.994]
+  # The PSF was measured on a static point source at the centre of the FOV.
+  # Both assumptions (spatial invariance, static-vs-dynamic) are limitations;
+  # see sensitivity.psf_scale below for the check.
+  spatially_invariant: true
+
+# ---------------------------------------------------------------------
+# PVC configuration.
+# ---------------------------------------------------------------------
+pvc:
+  methods: [RL, RVC]
+
+  # Fixed iteration count applied to *all* frames of a scan.  The primary
+  # setting is `iterations_primary`; `iterations_grid` is the sensitivity
+  # analysis reported alongside it (project description, Methods step 1).
+  iterations_primary: 15
+  iterations_grid: [10, 15, 20]
+
+  # Reblurred Van Cittert relaxation parameter, carried over from the
+  # project thesis.
+  rvc_alpha: 1.5
+  # Disable PETPVC's internal stopping criterion so an exact iteration
+  # count is run.
+  disable_stopping_criterion: true
+
+  # Where PVC is applied.  "native" = at the reconstructed voxel grid of the
+  # DICOM (recommended: the measured PSF refers to that grid), after which the
+  # corrected series is resampled onto the DLIF input grid.
+  # "dlif_grid" applies PVC directly on the 96x48x48 grid and is only a
+  # fallback for comparison -- the effective PSF there is not the measured one.
+  domain: native
+
+  # Frames are processed independently; set >1 to use several worker
+  # processes on the same scan.
+  workers: 4
+  # Skip work whose output already exists (makes the batch resumable).
+  resume: true
+
+sensitivity:
+  # Multiplicative perturbation of the PSF FWHM, to test how sensitive RL and
+  # RVC are to PSF mismatch (RL is expected to be more sensitive).
+  psf_scale: [0.9, 1.0, 1.1]
+
+# ---------------------------------------------------------------------
+# Preprocessing: reconstructed grid -> DLIF input grid.
+#
+# The group's preprocessing is a PURE CROP at native resolution -- no
+# resampling, no smoothing, no rotation.  96 x 48 x 48 voxels at
+# 0.5 x 0.5 x 0.59675 mm is 57.3 x 24 x 24 mm, cut straight out of the
+# 128 x 92 x 92 reconstruction; fitting that window against a distributed
+# IMG_*.pkl reproduces it at r = 1.0000.
+#
+# Two consequences worth stating in the thesis:
+#   * the network input voxels ARE reconstruction voxels, so the measured
+#     point-source PSF applies to them directly and PVC done at native
+#     resolution carries into the input one-to-one, with no interpolation
+#     blurring the correction back out;
+#   * the uncorrected condition reproduces the distributed inputs, so the
+#     pretrained model is used on exactly the data it was trained on.
+#
+# The window position is per-scan (mice are not positioned identically).  It is
+# recovered by matching each scan's distributed input, is fixed once in stage 01
+# from the UNCORRECTED series, and is reused verbatim for every condition.  If
+# it were recomputed on corrected data, deconvolution would shift the centre of
+# mass slightly and the conditions would differ by a crop as well as by PVC.
+# ---------------------------------------------------------------------
+preprocessing:
+  # Apply the per-scan intensity factor recovered alongside the window (~0.99).
+  # It is a single scalar per scan, applied identically to every condition, so
+  # it cannot bias the comparison; it exists so the uncorrected tree matches
+  # the distributed inputs numerically as well as geometrically.
+  apply_intensity_scale: true
+  # Used to seed the window search, and to place it for any scan with no
+  # distributed input to match against.
+  late_fraction: 0.4        # fraction of trailing frames averaged to find the animal
+  threshold_fraction: 0.15  # body threshold, as a fraction of the 99.5th percentile
+
+# ---------------------------------------------------------------------
+# DLIF input grid.
+# ---------------------------------------------------------------------
+dlif_grid:
+  # Every shape the pipeline builds an input tree for.  Two are needed because
+  # the deployed model and the retrained model take different sizes -- see the
+  # dlif section below.  The reference tree distributed with the DLIF
+  # repository is 96x48x48, so that is the one the calibration is fitted
+  # against.
+  shapes:
+    - [64, 48, 48]
+    - [96, 48, 48]
+  # The shape the distributed inputs use, which the agreement diagnostic in
+  # stage 01 is measured against.
+  reference_shape: [96, 48, 48]
+  interpolation_order: 1
+
+# ---------------------------------------------------------------------
+# Experimental conditions.
+# Every condition produces one predicted input function per scan, so the
+# design is fully paired across conditions.
+#
+# A condition that names a PVC method without an iteration count inherits
+# pvc.iterations_primary, so the primary setting lives in exactly one place.
+# Give an explicit count only to pin a condition to a specific point of the
+# iteration grid.
+# ---------------------------------------------------------------------
+conditions:
+  - name: baseline_pretrained
+    pvc: null
+    motion: false
+    model: pretrained
+  - name: rl_pretrained
+    pvc: {method: RL}
+    motion: false
+    model: pretrained
+  - name: rvc_pretrained
+    pvc: {method: RVC}
+    motion: false
+    model: pretrained
+  - name: baseline_retrained
+    pvc: null
+    motion: false
+    model: retrained
+  - name: rl_retrained
+    pvc: {method: RL}
+    motion: false
+    model: retrained
+  - name: rvc_retrained
+    pvc: {method: RVC}
+    motion: false
+    model: retrained
+  # Motion-corrected subset (exploratory, secondary).
+  - name: mc_baseline_retrained
+    pvc: null
+    motion: true
+    model: retrained
+    subset: motion_affected
+  - name: mc_rl_retrained
+    pvc: {method: RL}
+    motion: true
+    model: retrained
+    subset: motion_affected
+
+# The reference condition every comparison is made against.
+#
+# This is the retrained baseline, not the pretrained one.  Both the reference
+# and the corrected conditions are then models trained on this pipeline's own
+# preprocessing, so the comparison isolates PVC and does not depend on
+# reproducing the group's undocumented preprocessing.  The pretrained
+# conditions remain in the design as a robustness check: they measure how the
+# deployed model behaves under the distribution shift PVC introduces.
+reference_condition: baseline_retrained
+
+# ---------------------------------------------------------------------
+# DLIF model / training.
+# `retrain` reproduces the baseline training protocol exactly, with only the
+# input representation changed, so the comparison isolates the effect of PVC.
+# ---------------------------------------------------------------------
+dlif:
+  n_frames: 42
+
+  # ------------------------------------------------------------------
+  # The deployed model (Kuttner et al. 2024).
+  #
+  # DLIFNet.pt is a pickled nn.Module, not a state dict, so it carries the
+  # architecture it was trained with: a two-channel encoder of width
+  # 8/16/32/64/128 with batch normalisation, and a TCN of 256/128/64/32.
+  # The repository's current models.py builds a narrower network with the
+  # normalisation commented out, so rebuilding the architecture from that code
+  # and loading the weights into it transfers almost nothing and produces a
+  # randomly initialised "baseline". The pipeline therefore loads the module
+  # itself (dlif.pretrained.load_as: module).
+  #
+  # Its bottleneck is a plain Conv3d with a (4, 3, 3) kernel after four pooling
+  # stages, which collapses to a single voxel only for a 64x48x48 input -- not
+  # the 96x48x48 tree that ships with the repository. Hence input_shape below.
+  # Confirm the exact 64x48x48 preprocessing with the group; a centre crop of
+  # the 96-slice grid reproduces sensible predictions but is an assumption.
+  # ------------------------------------------------------------------
+  pretrained:
+    weights: "src/models/pretrained_weigths/DLIFNet.pt"
+    load_as: module            # module | state_dict
+    input_shape: [64, 48, 48]
+    in_channels: 2
+    add_average: true          # second channel = mean of frames >= 35
+
+  # ------------------------------------------------------------------
+  # The architecture retrained on corrected data.  Built from the repository's
+  # current code, so it is whatever models.py defines today.
+  # ------------------------------------------------------------------
+  retrain_model:
+    model_name: DLIFNet_MAX
+    input_shape: [96, 48, 48]
+    in_channels: 1
+    add_average: false
+
+  cv:
+    n_folds: 10
+    n_runs: 10               # repeats per fold, as in the baseline protocol
+    validation_size: 0.15
+    stratify_by: group       # keys of datahandlers/shared_dicts.groups
+  train:
+    epochs: 300
+    min_epochs: 20
+    batch_size: 16
+    learning_rate: 0.001
+    optimizer: Adam
+    weight_decay: 0.0
+    loss: WeightedMSELoss
+    scheduler: CosineAnnealingLR
+    eta_min: 0.0001
+    t_max: 100
+    early_stopping: false
+    patience: 30
+    monitor: val_loss
+    device: cuda
+    amp: true
+  finetune:
+    # Used when mode == "finetune" instead of "retrain": start from the
+    # pretrained weights and train with a reduced learning rate.
+    enabled: false
+    learning_rate: 0.0001
+    epochs: 100
+    freeze_encoder: false
+  augmentation:
+    poisson_noise: true
+    random_flip: true
+    temporal_augmentation: false
+
+  # IDs excluded from the study, carried over from the group's config.
+  ignore_ids: ["T1","T2","T3","R2","R3","R4","AE4","AF1","AF2","Q2","S4","R1",
+               "AE1","AE2","AE3","N4","P1","AS1","AS2","AS4","AT1","AT2","AT3",
+               "AT4","AU1","AU2","AU3",
+               "Sherbrooke-A","Sherbrooke-B","Sherbrooke-C","Sherbrooke-D","Sherbrooke-E"]
+
+# ---------------------------------------------------------------------
+# Motion correction (secondary, exploratory).
+# ---------------------------------------------------------------------
+motion:
+  # Scans with the cyclic inter-frame artifact.  To be filled in after the
+  # review with C. Salomonsen; scripts/07_motion_subset.py can propose
+  # candidates from the automatic detector.
+  affected_ids: []
+  detector:
+    # Frame-to-frame centre-of-mass displacement above this (mm) flags a scan.
+    com_threshold_mm: 0.5
+    # Periodicity of the displacement series above this flags "cyclic".
+    cyclic_autocorr_threshold: 0.4
+  reference_frame: "late_mean"   # late_mean | first | max_counts
+  # Order in which motion correction and PVC are applied.  Both are run and
+  # compared (project description, Section 3.1).
+  order: [mc_then_pvc, pvc_then_mc]
+
+# ---------------------------------------------------------------------
+# Evaluation.
+# ---------------------------------------------------------------------
+evaluation:
+  metrics: [rmse, nrmse, mae, r2, auc_ratio, auc_peak, auc_tail,
+            peak_height, peak_time, fwhm, ccc, pearson_r]
+  # Frame stratification for the early-vs-late analysis; boundaries in
+  # minutes post injection.
+  frame_bins_min: [0.0, 1.0, 2.5, 5.5, 40.5]
+  bias_variance:
+    # Repeats over which the variance component is estimated.
+    over: runs
+  statistics:
+    test: wilcoxon              # paired, non-parametric
+    alternative: two-sided
+    effect_size: rank_biserial
+    ci_method: bootstrap
+    n_boot: 10000
+    multiple_comparison: holm
+    alpha: 0.05
+  kinetics:
+    enabled: true
+    models: [patlak, two_tissue]
+    target_vois: [Brain, Myocardium, Liver]
+    patlak_t_star_min: 5.0
+
+# ---------------------------------------------------------------------
+# Reporting.
+# ---------------------------------------------------------------------
+report:
+  figure_format: pdf
+  dpi: 300
+  latex_tables: true
+  # Directory relative to <work> where thesis-ready output is written.
+  out_subdir: report

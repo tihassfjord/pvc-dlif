@@ -1,0 +1,39 @@
+cff-version: 1.2.0
+title: >-
+  pvc-dlif: partial volume correction for deep-learning-derived input
+  functions in preclinical PET
+message: If you use this software, please cite it as below.
+type: software
+authors:
+  - given-names: Tor-Ivar
+    family-names: Hassfjord
+    affiliation: UiT - The Arctic University of Norway
+repository-code: https://github.com/<your-username>/pvc-dlif
+license: MIT
+keywords:
+  - positron emission tomography
+  - partial volume correction
+  - deconvolution
+  - arterial input function
+  - preclinical imaging
+references:
+  - type: article
+    title: >-
+      Deep-learning-derived input function in dynamic [18F]FDG PET imaging
+      of mice
+    authors:
+      - family-names: Kuttner
+        given-names: Samuel
+    journal: Frontiers in Nuclear Medicine
+    volume: 4
+    year: 2024
+  - type: article
+    title: >-
+      PETPVC: a toolbox for performing partial volume correction techniques
+      in positron emission tomography
+    authors:
+      - family-names: Thomas
+        given-names: Benjamin A.
+    journal: Physics in Medicine & Biology
+    volume: 61
+    year: 2016
