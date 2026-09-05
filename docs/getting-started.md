@@ -55,10 +55,23 @@ Stage 02 stops if PETPVC is not installed rather than quietly substituting the
 fallback. Add `--backend numpy` to that stage to get past it during a wiring
 check; do not report numbers produced that way.
 
-Stages 04 and 05 need the real DLIF repository and its weights, so the
-synthetic run stops at 03. What it proves is that the data layer works and that
-your environment is complete. If this fails, fix it here rather than on a run
-that takes days.
+Stages 04 and 05 need the DLIF repository and its weights. If you have them,
+point `paths.dlif_repo` in `configs/synthetic.yaml` at the clone, set
+`dlif_grid.shapes` to `[[64, 48, 48]]` and `retrain_model.input_shape` to
+`[64, 48, 48]` (the synthetic reference is 64 slices, so there is no 96-slice
+window to cut), and the chain runs through to 08:
+
+```bash
+python scripts/04_infer_baseline.py --config configs/synthetic.yaml --device cpu
+python scripts/05_retrain.py --config configs/synthetic.yaml --folds 1 --runs 2 --epochs 3 --device cpu
+python scripts/06_evaluate.py  --config configs/synthetic.yaml --skip-kinetics
+python scripts/08_report.py    --config configs/synthetic.yaml
+```
+
+Folds are numbered from 1. What all of this proves is that the data layer,
+the model adapter, the training loop and the evaluation read and write the
+same files; the numbers mean nothing. If this fails, fix it here rather than
+on a run that takes days.
 
 ---
 

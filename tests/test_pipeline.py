@@ -376,6 +376,12 @@ class TestFolds:
         assert sorted(test_ids) == sorted(ids)
         assert len(set(test_ids)) == len(ids)
 
+    def test_folds_are_numbered_from_one(self):
+        """The group's convention, and what ``--folds`` on stage 05 expects.
+        ``--folds 0`` once selected nothing and reported success."""
+        folds = make_folds([f"S{i}" for i in range(20)], 4, seed=1)
+        assert [f.index for f in folds] == [1, 2, 3, 4]
+
     def test_train_and_test_never_overlap(self):
         folds = make_folds([f"S{i}" for i in range(50)], 5, seed=1)
         for fold in folds:

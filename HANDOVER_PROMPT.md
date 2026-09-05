@@ -130,17 +130,28 @@ different matrix (128 × 120 × 120) but are all excluded.
 
 ## 4. Verification status — be honest about this
 
-| Stage | Real data | Synthetic end-to-end |
+| Stage | Real data | Synthetic, with the group's real DLIF repo |
 |---|---|---|
 | 00 inventory | ✅ 70/102 usable | ✅ |
 | 01 convert + preprocessing | ✅ r = 1.00000 | ✅ r = 0.99999 |
 | 02 PVC | ❌ PETPVC not installed | ✅ (numpy backend) |
 | 03 network inputs | ✅ | ✅ |
-| 04 pretrained inference | ✅ | ✅ |
-| 05 retrain | ❌ | ✅ |
-| 06 evaluate | ❌ | ✅ |
+| 04 pretrained inference | ✅ | ✅ real `DLIFNet.pt`, 2 203 104 params, 2 ch, 64×48×48 |
+| 05 retrain | ❌ | ✅ real `models.py`, CPU pilot: 1 fold × 2 runs × 3 epochs, checkpoints + summaries written |
+| 06 evaluate | ❌ | ✅ predicts from those checkpoints; bias/variance estimable from the repeats |
 | 07 motion | ❌ | ✅ (screen only) |
 | 08 report | ❌ | ✅ |
+
+The synthetic column for 04–06 was produced with `paths.dlif_repo` pointing at a copy of the
+real repository (`src/models`, `src/datahandlers`, `src/training`, the weights). For that run
+the config was changed to `dlif_grid.shapes: [[64,48,48]]` and
+`retrain_model.input_shape: [64,48,48]`, because the synthetic reference is 64 slices and no
+96-slice window exists to cut; the real data needs no such change. Numbers from that run mean
+nothing — 3 epochs on 12 fake scans — but every file the next stage reads was written and read.
+
+One bug found and fixed by doing it: `--folds 0` on stage 05 selected no fold (they are
+numbered 1..n) and exited 0 having trained nothing. It now exits with an error naming the
+valid range.
 
 **No stage has ever run on the full 70-scan real dataset, and PETPVC is not installed on the
 owner's machine.** Installing it (`conda install -c conda-forge petpvc`) and confirming CUDA

@@ -13,7 +13,7 @@ the scan IDs and the seed alone, so every condition trains and tests on exactly
 the same partitions.
 
     python scripts/05_retrain.py --conditions baseline_retrained rl_retrained
-    python scripts/05_retrain.py --folds 1 2 --runs 3      # a cheaper pilot
+    python scripts/05_retrain.py --folds 1 2 --runs 3      # a cheaper pilot (folds are 1-based)
 """
 
 from __future__ import annotations
@@ -93,6 +93,12 @@ def main() -> int:
 
     all_folds = make_folds(base_ids, n_folds, config.seed)
     folds = [f for f in all_folds if args.folds is None or f.index in set(args.folds)]
+    if not folds:
+        # Folds are numbered 1..n_folds (the group's convention). Selecting none
+        # must be an error, not a run that trains nothing and reports success.
+        raise SystemExit(
+            f"--folds {args.folds} selects no fold; valid indices are 1..{len(all_folds)}"
+        )
 
     LOGGER.info(
         "%s %d conditions on %d scans, %d folds x %d runs, %d epochs, device %s",
