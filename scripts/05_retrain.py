@@ -51,6 +51,12 @@ def main() -> int:
 
     manifest = load_manifest(config.work / "manifest.json")
     repo = DlifRepo(config.dlif_repo)
+    LOGGER.info("DLIF repository: %s (commit %s)", repo.root, repo.commit() or "not a git clone")
+    if repo.commit() is None:
+        LOGGER.warning(
+            "paths.dlif_repo is not a git clone, so the version of models.py being trained "
+            "cannot be recorded. Point it at a clean clone of the group's repository."
+        )
 
     # Check the configured input shape against what the architecture can take,
     # before spending hours discovering it inside a convolution.
@@ -177,7 +183,7 @@ def main() -> int:
             "total_hours": round(sum(r.seconds for r in results) / 3600, 2),
             "checkpoints": str(out_dir),
         }
-        write_provenance(out_dir / "training.json", "05_retrain", config,
+        write_provenance(out_dir / "training.json", "05_retrain", config, dlif_repo=repo.describe(),
                          condition=condition.name, mode="finetune" if finetune else "retrain",
                          settings=settings.__dict__)
 

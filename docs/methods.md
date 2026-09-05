@@ -44,6 +44,12 @@ the comparison entirely.
 | `rl_retrained` | Richardson–Lucy | retrained |
 | `rvc_retrained` | Reblurred Van Cittert | retrained |
 
+The deployed model (`DLIFNet.pt`, 2.2 M parameters, two input channels) and the model the
+repository trains today (`DLIFNet_MAX`, the 90 124-parameter FC-DLIF of Kuttner et al.
+2026) are different networks. The retrained arm trains the latter, from scratch, with the
+published protocol — 10 folds × 10 runs, 1000 epochs, batch 8, Adam at 10⁻⁴, weighted MSE,
+Poisson-noise and flip augmentation — on each input representation.
+
 **The reference is the retrained baseline, not the pretrained one.** Both the
 reference and the corrected conditions are then models trained on this
 pipeline's own preprocessing, so the comparison isolates the correction and

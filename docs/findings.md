@@ -6,33 +6,42 @@ layers, or you will rediscover them the hard way.
 
 ---
 
-## 1. The distributed checkpoint does not match the repository's model code
+## 1. The repository holds two published models, and they are not the same network
 
-`DLIF-main/src/models/pretrained_weigths/DLIFNet.pt` is a **pickled `nn.Module`**, not a state
-dict, and it carries the architecture it was trained with:
+`DLIFNet.pt` under `src/models/pretrained_weigths/` is a **pickled `nn.Module`**, not a state
+dict, and it is *not* an instance of the `DLIFNet_MAX` class the repository trains today:
 
-| | Checkpoint | Repository's current `models.py` |
+| | `DLIFNet.pt` (deployed checkpoint) | `DLIFNet_MAX` (`models.py`) |
 |---|---|---|
-| Input channels | 2 | 1 |
+| Publication | Frontiers in Nuclear Medicine 2024 lineage | EJNMMI Research 2026 ("FC-DLIF") |
+| Input | 64 × 48 × 48, **2 channels** (image + late-frame average) | 96 × 48 × 48, 1 channel |
 | Encoder widths | 8 / 16 / 32 / 64 / 128 | 8 / 8 / 16 / 16 / 32 |
-| Batch normalisation | present | commented out |
+| Bottleneck | `Conv3d(128→256, k=(4,3,3))` | `Conv3d(32→32, k=(4,2,2))` + adaptive average pool |
 | TCN | 256 → 128 → 64 → 32 | 32 → 16 → 8 → 4 |
-| Parameters | 2 203 104 | 90 124 |
+| Parameters | 2 203 104 | **90 124** (the figure the 2026 paper states) |
 
-Building the architecture from today's `models.py` and loading the weights into it transfers
-**2 of 18 parameter tensors**. The remaining 16 keep their random initialisation, so the
-"pretrained baseline" would be a mostly untrained network — and it would fail quietly, looking
-like a poor result rather than a broken one.
+Rebuilding the architecture from `models.py` and loading the checkpoint into it transfers
+**2 of 18 parameter tensors**; the rest keep their random initialisation and the "pretrained
+baseline" is a mostly untrained network that fails quietly.
 
-**Consequence.** Load the checkpoint as the module it is:
+**Consequences.**
 
-```python
-from pvc_dlif.dlif.adapter import DlifRepo, load_pretrained_module
-model, spec, info = load_pretrained_module(DlifRepo(repo_path))
-```
+- The pretrained arm loads the checkpoint as the module it is:
+  `adapter.load_pretrained_module()`. `load_pretrained_model()` (state-dict path) still exists
+  for other checkpoints and logs an error when transfer is poor.
+- The retrained arm trains `DLIFNet_MAX` — the 2026 architecture — from scratch on each input
+  representation. That is the model the group currently publishes and trains; it is also the
+  one whose training protocol is in the repository's `config.yaml`.
+- The two arms therefore differ in architecture *by design of the repository*, not by
+  accident. The comparison that matters — corrected vs uncorrected — is within each arm.
 
-`load_pretrained_model()` (the state-dict path) still exists for other checkpoints, and logs an
-error when transfer is poor. Do not resolve this by editing the group's repository.
+**Use a clean clone.** A copy of the repository that had been experimented in (extra
+`UltraDLIF`/`VGGNet_DLIF` classes, and `config.yaml` changed to 300 epochs / batch 16 /
+lr 1e-3) was in circulation. Diffed against upstream `Kuttner/DLIF` at commit `6526932`,
+`models.py`'s `DLIFNet`/`DLIFNet_MAX`, the encoder, the conv blocks, the augmentation, the
+loss and the group dictionaries are identical; only the hyperparameters had drifted. The
+pipeline reads the published values (1000 epochs, batch 8, Adam 1e-4, no scheduler) and
+records the repository commit in the provenance of stages 04 and 05.
 
 ---
 

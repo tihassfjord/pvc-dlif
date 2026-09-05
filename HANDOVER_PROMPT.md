@@ -31,7 +31,8 @@ from them has already been carried across.
 | **The repository — everything you touch** | `E:\ML4PET\pvc-dlif` |
 | Raw DICOM, 102 dynamic mouse scans | `E:\ML4PET\ML4PET_DLIF\aif-mice-dicom-pet` |
 | Group's DLIF data (AIF / IMG / VOI pickles) | `E:\ML4PET\ML4PET_DLIF\data` |
-| Group's DLIF repo + pretrained weights | `E:\ML4PET\ML4PET_DLIF\DLIF-main(1)\DLIF-main` |
+| Group's DLIF repo (clean clone of private github.com/Kuttner/DLIF) | `E:\ML4PET\DLIF-upstream` |
+| Old experimented-in copy of the same repo (do not use) | `E:\ML4PET\ML4PET_DLIF\DLIF-main(1)\DLIF-main` |
 | All generated output | `E:\ML4PET\thesis_work` (set in the config) |
 | Thesis LaTeX | `ML4PET_MASTER\00_MASTER_THESIS\tex\01_Draft\` |
 | Old pipeline copy (reference only, do not edit) | `ML4PET_MASTER\thesis_pipeline` |
@@ -84,14 +85,17 @@ He will read and maintain this. Match the style already in `gui/pvc_dlif_gui/`:
 Established empirically against the real data. Each is load-bearing. Full detail with the
 numbers is in `docs/findings.md`.
 
-**3.1 — `DLIFNet.pt` does not match the repo's `models.py`.**
-The checkpoint is a pickled `nn.Module`, not a state dict, and carries the *original*
-Frontiers architecture: 2-channel encoder of width 8/16/32/64/128 with BatchNorm, TCN
-256→128→64→32, 2 203 104 parameters. The repo's current `models.py` builds a narrower network
-with BatchNorm commented out. Rebuilding from that code and loading the weights transfers
-**2 of 18 tensors** — a "pretrained baseline" that is ~95 % random, and it fails quietly.
-→ Always load via `pvc_dlif.dlif.adapter.load_pretrained_module()`. Do not "fix" this by
-editing the group's repo.
+**3.1 — The repo holds two published models; `DLIFNet.pt` is not a `DLIFNet_MAX`.**
+`DLIFNet.pt` is a pickled `nn.Module` from the Frontiers 2024 lineage: 2-channel encoder
+8/16/32/64/128, TCN 256→128→64→32, 2 203 104 parameters, 64 × 48 × 48 input. `DLIFNet_MAX`
+in `models.py` is the EJNMMI Research 2026 model (FC-DLIF): 1 channel, 96 × 48 × 48,
+**90 124 parameters**. Loading the checkpoint into a `DLIFNet_MAX` transfers 2 of 18 tensors.
+→ Pretrained arm: `adapter.load_pretrained_module()`. Retrained arm: `DLIFNet_MAX` from
+scratch, with the *published* protocol (1000 epochs, batch 8, Adam 1e-4, no scheduler,
+weighted MSE, Poisson noise + flips). `paths.dlif_repo` must be a **clean clone** of the
+private `Kuttner/DLIF` repository (`E:\ML4PET\DLIF-upstream`, commit `6526932`); the
+`DLIF-main(1)` copy had extra experiments and drifted hyperparameters. Stages 04/05 record
+the commit in provenance.
 
 **3.2 — The pretrained model needs 64 × 48 × 48 and 2 channels.**
 Its bottleneck is `Conv3d(kernel=(4,3,3))` after four pooling stages, which collapses to one
@@ -217,7 +221,8 @@ Drive a complete run and fix what breaks. Known risks:
 
 - **Stage 02 scale.** 70 scans × 42 frames × 2 methods. `pvc.workers` parallelises over
   frames; tune it. `--sweep` triples the work and is needed for the sensitivity analysis.
-- **Stage 05 cost.** 3 retrained conditions × 10 folds × 10 runs = **300 trainings**. Not
+- **Stage 05 cost.** 3 retrained conditions × 10 folds × 10 runs = **300 trainings** of
+  1000 epochs each (the published protocol; an earlier config said 300). Not
   feasible on CPU. Confirm CUDA works; if it does not, that is a blocker to raise, not to
   route around. `--runs 3` gives a directional answer sooner; more repeats only sharpen the
   variance term.

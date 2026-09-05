@@ -20,7 +20,7 @@ dlif_data_root/
   IMG_SUV_96x48x48/  IMG_AA1.pkl    the network inputs the group distributes
   VOI_SUV/       VOI_AA1.pkl        tissue curves, for the kinetic modelling
 
-dlif_repo/                          a clone of the group's DLIF repository
+dlif_repo/                          a *clean* clone of the group's DLIF repository (private)
   src/models/models.py
   src/models/pretrained_weigths/DLIFNet.pt
   src/datahandlers/shared_dicts.py  group membership, used for stratification

@@ -247,13 +247,21 @@ dlif:
     validation_size: 0.15
     stratify_by: group       # keys of datahandlers/shared_dicts.groups
   train:
-    epochs: 300
+    # The published protocol (Kuttner et al., EJNMMI Research 2026; upstream
+    # src/config.yaml): 1000 epochs, batch 8, Adam at 1e-4, constant learning
+    # rate, weighted MSE, mixed precision.  A copy of the repository that had
+    # been experimented in carried 300 / 16 / 1e-3 and an earlier version of
+    # this file inherited those; do not "tune" these.
+    epochs: 1000
     min_epochs: 20
-    batch_size: 16
-    learning_rate: 0.001
+    batch_size: 8
+    learning_rate: 0.0001
     optimizer: Adam
     weight_decay: 0.0
     loss: WeightedMSELoss
+    # The group's config defines a CosineAnnealingLR scheduler but has
+    # training.scheduler: False, i.e. it is not used.  Same here.
+    use_scheduler: false
     scheduler: CosineAnnealingLR
     eta_min: 0.0001
     t_max: 100

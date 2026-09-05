@@ -46,17 +46,20 @@ def set_seed(seed: int) -> None:
 class TrainSettings:
     """Training hyper-parameters, mirroring the baseline configuration."""
 
-    epochs: int = 300
+    epochs: int = 1000          # upstream config.yaml / EJNMMI Res. 2026
     min_epochs: int = 20
-    batch_size: int = 16
-    learning_rate: float = 1e-3
+    batch_size: int = 8
+    learning_rate: float = 1e-4
     weight_decay: float = 0.0
     optimizer: str = "Adam"
     loss: str = "WeightedMSELoss"
     scheduler: str = "CosineAnnealingLR"
     eta_min: float = 1e-4
     t_max: int = 100
-    use_scheduler: bool = True
+    # The group's config has ``training.scheduler: False``: the scheduler section
+    # exists but is switched off, so the published runs used a constant learning
+    # rate.  Off by default here for the same reason.
+    use_scheduler: bool = False
     early_stopping: bool = False
     patience: int = 30
     monitor: str = "val_loss"
@@ -68,14 +71,15 @@ class TrainSettings:
     def from_config(cls, config, finetune: bool = False) -> "TrainSettings":
         train = dict(config.get("dlif.train", {}))
         settings = cls(
-            epochs=int(train.get("epochs", 300)),
+            epochs=int(train.get("epochs", 1000)),
             min_epochs=int(train.get("min_epochs", 20)),
-            batch_size=int(train.get("batch_size", 16)),
-            learning_rate=float(train.get("learning_rate", 1e-3)),
+            batch_size=int(train.get("batch_size", 8)),
+            learning_rate=float(train.get("learning_rate", 1e-4)),
             weight_decay=float(train.get("weight_decay", 0.0)),
             optimizer=str(train.get("optimizer", "Adam")),
             loss=str(train.get("loss", "WeightedMSELoss")),
             scheduler=str(train.get("scheduler", "CosineAnnealingLR")),
+            use_scheduler=bool(train.get("use_scheduler", False)),
             eta_min=float(train.get("eta_min", 1e-4)),
             t_max=int(train.get("t_max", 100)),
             early_stopping=bool(train.get("early_stopping", False)),

@@ -87,7 +87,7 @@ Set four paths, and nothing else:
 paths:
   dicom_root:     "E:/.../aif-mice-dicom-pet"   # dPET_dcm_<ID> exports
   dlif_data_root: "E:/.../data"                 # AIF_SUV/ IMG_SUV_*/ VOI_SUV/
-  dlif_repo:      "E:/.../DLIF-main"            # the model and its weights
+  dlif_repo:      "E:/.../DLIF-upstream"        # a clean clone of Kuttner/DLIF
   work:           "E:/.../thesis_work"          # generated output
 ```
 

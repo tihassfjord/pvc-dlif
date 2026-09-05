@@ -115,7 +115,7 @@ def main() -> int:
         return 1
 
     path = save_predictions(all_predictions, config.dir_predictions / "pretrained.parquet")
-    write_provenance(path, "04_infer", config, model_info=info,
+    write_provenance(path, "04_infer", config, model_info=info, dlif_repo=repo.describe(),
                      input_shape=list(shape), add_average=spec.add_average,
                      conditions=[c.name for c in conditions])
 

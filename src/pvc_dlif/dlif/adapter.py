@@ -86,6 +86,36 @@ class DlifRepo:
 
             return {str(k): [str(v) for v in vals] for k, vals in groups.items()}
 
+    def commit(self) -> str | None:
+        """The git commit the checkout is at, or None if it is not a git clone.
+
+        Read from ``.git`` directly so no git binary is needed.  Recorded in the
+        provenance of stages 04 and 05, because "which version of the group's
+        code" is exactly the question a copy that has been experimented in
+        cannot answer.
+        """
+        git_dir = self.root / ".git"
+        head = git_dir / "HEAD"
+        if not head.exists():
+            return None
+        ref = head.read_text(encoding="utf-8").strip()
+        if not ref.startswith("ref:"):
+            return ref                                  # detached HEAD
+        ref_name = ref.split(None, 1)[1]
+        ref_file = git_dir / ref_name
+        if ref_file.exists():
+            return ref_file.read_text(encoding="utf-8").strip()
+        packed = git_dir / "packed-refs"
+        if packed.exists():
+            for line in packed.read_text(encoding="utf-8").splitlines():
+                if line.endswith(" " + ref_name):
+                    return line.split()[0]
+        return None
+
+    def describe(self) -> dict:
+        """What to write into provenance: where the code came from."""
+        return {"path": str(self.root), "commit": self.commit()}
+
     def available_models(self) -> list[str]:
         import torch.nn as nn
 
