@@ -265,3 +265,64 @@ class TestDetached:
         self._wait(state["pid"], timeout=5)
         assert not detached.pid_alive(state["pid"])
         assert detached.exit_code_from_log(state["log_path"], state["pid"]) is None   # killed: no marker
+
+
+# ==================================================================== #
+# cluster bundle
+# ==================================================================== #
+class TestClusterBundle:
+    def test_pack_and_collect_round_trip(self, tmp_path):
+        """Pack a work tree, 'train' inside the bundle, merge back only complete runs."""
+        import subprocess
+        import pickle
+
+        # A minimal work tree: manifest with two usable scans, one input tree, AIFs
+        config_text = (REPO / "configs" / "example.yaml").read_text(encoding="utf-8")
+        cfg = tmp_path / "thesis.yaml"
+        cfg.write_text(config_text, encoding="utf-8")
+        for sub in ("dicom", "data/AIF_SUV", "repo/src/models", "work/dlif_inputs"):
+            (tmp_path / sub).mkdir(parents=True)
+        save_values(cfg, {"paths.dicom_root": str(tmp_path / "dicom"),
+                          "paths.dlif_data_root": str(tmp_path / "data"),
+                          "paths.dlif_repo": str(tmp_path / "repo"),
+                          "paths.work": str(tmp_path / "work")})
+        config = load_config(cfg)
+        _fake_manifest(config.work, ["A1", "A2"], {})
+        (tmp_path / "repo" / "COMMIT").write_text("abc123\n")
+        for scan in ("A1", "A2"):
+            with open(tmp_path / "data" / "AIF_SUV" / f"AIF_{scan}.pkl", "wb") as f:
+                pickle.dump({"AIF_A_int": np.ones(3), "AIF_t_int": np.arange(3.0)}, f)
+            for tag in ("orig", "rl_i15", "rvc_i15"):
+                from pvc_dlif.data import pkl_io
+                pkl_io.save_img(config.dir_dlif_inputs / tag, scan,
+                                np.zeros((3, *config.retrain_shape), np.float64), np.arange(3.0))
+
+        out = tmp_path / "bundle"
+        result = subprocess.run([sys.executable, str(REPO / "scripts" / "cluster" / "pack_stage05.py"),
+                                 "--config", str(cfg), "--out", str(out)], capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        assert (out / "configs" / "cluster.yaml").exists()
+        assert (out / "run" / "stage05_slurm.sh").exists()
+        assert (out / "dlif_repo" / "COMMIT").read_text().strip() == "abc123"
+        assert len(list((out / "work" / "dlif_inputs").rglob("IMG_*.pkl"))) == 6
+        with open(next((out / "work" / "dlif_inputs").rglob("IMG_*.pkl")), "rb") as f:
+            assert pickle.load(f)["IMG"].dtype == np.float32           # downcast by default
+        assert (out / "run" / "conditions.txt").read_text().split() == [
+            "baseline_retrained", "rl_retrained", "rvc_retrained"]
+
+        # Two runs 'from the cluster': one complete, one not
+        for run, epochs in (("run_01", 1000), ("run_02", 5)):
+            d = out / "work" / "models" / "rl_retrained" / "fold_01" / run
+            d.mkdir(parents=True)
+            (d / "model.pt").write_bytes(b"x")
+            (d / "summary.json").write_text(json.dumps({"epochs_trained": epochs}))
+        result = subprocess.run([sys.executable, str(REPO / "scripts" / "cluster" / "collect_stage05.py"),
+                                 "--config", str(cfg), "--from", str(out / "work" / "models")],
+                                capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        report = json.loads(result.stdout[result.stdout.index("{"):])
+        assert report["copied"] == 1
+        assert report["skipped_incomplete_on_cluster"] == [["rl_retrained/fold_01/run_02", 5]]
+        assert (config.dir_models / "rl_retrained" / "fold_01" / "run_01" / "model.pt").exists()
+        assert not (config.dir_models / "rl_retrained" / "fold_01" / "run_02").exists()
+        assert report["still_missing_count"] == 3 * 10 * 10 - 1

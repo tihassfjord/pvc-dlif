@@ -97,6 +97,12 @@ class DlifRepo:
         git_dir = self.root / ".git"
         head = git_dir / "HEAD"
         if not head.exists():
+            # A bundle made by scripts/cluster/pack_stage05.py carries the
+            # commit in a plain file instead of a .git directory.
+            marker = self.root / "COMMIT"
+            if marker.exists():
+                text = marker.read_text(encoding="utf-8").strip()
+                return text if text and text != "unknown" else None
             return None
         ref = head.read_text(encoding="utf-8").strip()
         if not ref.startswith("ref:"):

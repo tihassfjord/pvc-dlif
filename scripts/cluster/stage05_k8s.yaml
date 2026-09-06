@@ -1,0 +1,57 @@
+# Kubernetes job for one (condition, fold) of stage 05 - the shape the group's
+# own docs/DLIF.yaml uses (one GPU per fold, jobs submitted per fold).
+#
+# Copy the bundle to the cluster's persistent volume at /storage/pvc-dlif-bundle,
+# then for each condition and fold:
+#
+#     sed -e 's/__COND__/rl_retrained/' -e 's/__FOLD__/3/' run/stage05_k8s.yaml | kubectl apply -f -
+#
+# or loop it:
+#
+#     for c in $(cat run/conditions.txt); do for f in $(seq 1 $(cat run/n_folds.txt)); do
+#       sed -e "s/__COND__/$c/" -e "s/__FOLD__/$f/" run/stage05_k8s.yaml | kubectl apply -f -
+#     done; done
+#
+# The image needs python >= 3.10 with torch (CUDA), numpy, scipy, pandas,
+# pyyaml, scikit-learn, nibabel, pydicom; `pip install -e /storage/pvc-dlif-bundle/pvc-dlif`
+# is run at start so the image does not have to contain this package.
+kind: Job
+apiVersion: batch/v1
+metadata:
+  name: pvc-dlif-05-__COND__-f__FOLD__
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+      - name: stage05
+        image: "pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime"   # or the group's image, e.g. llu025/dlif:springfield
+        env:
+        - name: TZ
+          value: "Europe/Oslo"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        workingDir: /storage/pvc-dlif-bundle
+        command: ["/bin/sh", "-c"]
+        args:
+        - >
+          pip install -q -e pvc-dlif &&
+          bash run/stage05_one_fold.sh __COND__ __FOLD__
+        resources:
+          limits:
+            cpu: 4
+            memory: 16Gi
+            nvidia.com/gpu: 1
+        volumeMounts:
+        - name: storage
+          mountPath: /storage
+        - name: dshm
+          mountPath: /dev/shm
+      volumes:
+      - name: storage
+        persistentVolumeClaim:
+          claimName: storage
+      - name: dshm
+        emptyDir:
+          medium: Memory

@@ -221,6 +221,10 @@ Drive a complete run and fix what breaks. Known risks:
 
 - **Stage 02 scale.** 70 scans × 42 frames × 2 methods. `pvc.workers` parallelises over
   frames; tune it. `--sweep` triples the work and is needed for the sensitivity analysis.
+- **Stage 05 belongs on a cluster.** `scripts/cluster/` packs a self-contained bundle
+  (`pack_stage05.py`), ships SLURM and Kubernetes templates that run one (condition, fold)
+  per GPU — the group's own shape — and merges results back (`collect_stage05.py`). See
+  `docs/cluster.md`. The owner has cluster access.
 - **Stage 05 cost.** 3 retrained conditions × 10 folds × 10 runs = **300 trainings** of
   1000 epochs each (the published protocol; an earlier config said 300). Every scan is held
   in RAM per condition (~2.6 GB for 70) — without that, an epoch was disk-bound at 28 s on

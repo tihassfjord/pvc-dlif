@@ -131,6 +131,15 @@ class PipelineTab(ttk.Frame):
         ttk.Button(bar, text="None", width=6, command=lambda: self._set_all(False)).pack(side="left", padx=4)
         ttk.Button(bar, text="Refresh status", command=self.refresh_status).pack(side="left", padx=12)
         ttk.Button(bar, text="Open work folder", command=self._open_work).pack(side="left")
+        pack = ttk.Button(bar, text="Pack for cluster…", command=self._pack_for_cluster)
+        pack.pack(side="right")
+        ToolTip(pack, "Bundle everything stage 05 needs into one folder to copy to a cluster: "
+                      "inputs, curves, manifest, model code, this package, job templates. "
+                      "See docs/cluster.md.")
+        collect = ttk.Button(bar, text="Collect from cluster…", command=self._collect_from_cluster)
+        collect.pack(side="right", padx=6)
+        ToolTip(collect, "Merge a bundle's work/models (copied back from the cluster) into the "
+                         "local work tree; reports what is still missing.")
 
         # ----- options ------------------------------------------------
         opts = ttk.LabelFrame(self, text="Options", padding=8)
@@ -213,6 +222,8 @@ class PipelineTab(ttk.Frame):
             return
 
         running = self.state["stage"] if self.state else None
+        if running and running not in self.lights:          # a helper tool, not a stage
+            running = None
         for status in statuses:
             state = "running" if status.stage_id == running else status.state
             self._set_light(status.stage_id, state, status.progress_text, status.detail)
@@ -408,6 +419,52 @@ class PipelineTab(ttk.Frame):
                     self.log.write("  " + line)
             detached.write_state(config.work, None)
             self.refresh_status()
+
+    # ================================================================ #
+    # Cluster helpers - both just run the scripts in scripts/cluster/
+    # ================================================================ #
+    def _pack_for_cluster(self) -> None:
+        from tkinter import filedialog
+        if self.state:
+            messagebox.showinfo("Busy", "Wait for the running stage to finish first.")
+            return
+        config = self._config()
+        if config is None:
+            return
+        target = filedialog.askdirectory(title="Folder to create the cluster bundle in",
+                                         initialdir=str(config.work.parent))
+        if not target:
+            return
+        self._run_tool("pack", ["scripts/cluster/pack_stage05.py", "--out", target])
+
+    def _collect_from_cluster(self) -> None:
+        from tkinter import filedialog
+        if self.state:
+            messagebox.showinfo("Busy", "Wait for the running stage to finish first.")
+            return
+        source = filedialog.askdirectory(title="The bundle's work/models folder copied back from the cluster")
+        if not source:
+            return
+        self._run_tool("collect", ["scripts/cluster/collect_stage05.py", "--from", source])
+
+    def _run_tool(self, label: str, script_and_args: list[str]) -> None:
+        """Run a helper script the same way stages run, so its output is tailed."""
+        config = self._config()
+        if config is None:
+            return
+        script, *rest = script_and_args
+        command = [python_exe(), str(self.app.repo_root / script), "--config",
+                   str(self.config_path.get()), *rest]
+        self.log.clear()
+        self.log.write(f"===== {label} =====")
+        self.log.write("$ " + " ".join(command))
+        try:
+            self.state = detached.launch(command, config.work, label, cwd=self.app.repo_root)
+        except Exception as exc:                            # noqa: BLE001
+            self.log.write(f"ERROR: could not start {label}: {exc}")
+            return
+        self._queue = []
+        self._attach(config.work)
 
     def _cancel(self) -> None:
         if self.state is None:
