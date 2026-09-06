@@ -153,6 +153,7 @@ class DlifDataset:
         preload: bool = False,
         seed: int = 42,
         cache: dict | None = None,
+        augment_on_device: bool = False,
     ):
         self.data_root = Path(data_root)
         self.aif_root = Path(aif_root) if aif_root else self.data_root
@@ -164,6 +165,12 @@ class DlifDataset:
         self.random_flip = random_flip
         self.add_average = add_average
         self._rng = np.random.default_rng(seed)
+        # When True the item is returned raw (single channel, no noise, no
+        # flip) and the training loop applies the augmentation and the average
+        # channel on the GPU - see ``train.augment_on_device``.  Poisson noise
+        # over 9 M voxels per scan costs ~0.8 s in NumPy, which for 54 scans is
+        # a 40 s epoch with the GPU idle; on the GPU it is milliseconds.
+        self.augment_on_device = augment_on_device
         # A cache shared across the datasets of one condition: every scan is
         # read from disk once per condition, not once per epoch.  A 96x48x48x42
         # series is 74 MB as the float64 pickle and 37 MB as float32 here, so
@@ -205,6 +212,9 @@ class DlifDataset:
             self._cache[scan_id] = cached
         image, aif, times = cached
         image = np.array(image, copy=True)
+
+        if self.augment_on_device:
+            return {"INPUT": image[None, ...], "AIF": aif, "ID": scan_id, "TIME": times}
 
         if self.augment:
             image = self._augment(image)

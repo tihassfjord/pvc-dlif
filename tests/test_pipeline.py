@@ -1043,3 +1043,71 @@ class TestPreprocessing:
     def test_unknown_scan_is_an_error(self):
         with pytest.raises(KeyError, match="nope"):
             self._plan().transform("nope", self.CROP)
+
+
+class TestDeviceAugmentation:
+    """The GPU-side augmentation must match the NumPy path in distribution."""
+
+    def test_noise_is_zero_mean_and_poisson_scaled(self):
+        import torch
+        from pvc_dlif.dlif.train import augment_on_device
+        x = torch.full((2, 1, 42, 8, 8, 8), 4.0)
+        g = torch.Generator(); g.manual_seed(1)
+        y = augment_on_device(x, g, poisson_noise=True, random_flip=False, add_average=False)
+        noise = y - x
+        assert abs(float(noise.mean())) < 0.05                       # Poisson(rate) - rate
+        assert y.shape == x.shape
+
+    def test_average_channel_is_late_mean_of_the_noisy_image(self):
+        import torch
+        from pvc_dlif.dlif.train import augment_on_device
+        x = torch.rand(3, 1, 42, 6, 6, 6) * 3
+        g = torch.Generator(); g.manual_seed(2)
+        y = augment_on_device(x, g, poisson_noise=True, random_flip=True, add_average=True)
+        assert y.shape[1] == 2
+        assert torch.allclose(y[:, 1, 0], y[:, 0, 35:].mean(1), atol=1e-5)
+
+    def test_flip_is_in_plane_only(self):
+        import torch
+        from pvc_dlif.dlif.train import augment_on_device
+        x = torch.arange(2 * 1 * 3 * 2 * 4 * 4, dtype=torch.float32).reshape(2, 1, 3, 2, 4, 4)
+        g = torch.Generator(); g.manual_seed(3)
+        y = augment_on_device(x, g, poisson_noise=False, random_flip=True, add_average=False)
+        for b in range(2):
+            same = torch.equal(y[b], x[b])
+            flipped = torch.equal(y[b], torch.flip(x[b], dims=(-1, -2)))
+            assert same or flipped
+            assert torch.equal(y[b].sum(dim=(-1, -2)), x[b].sum(dim=(-1, -2)))   # z and t untouched
+
+    def test_training_loop_runs_with_device_augmentation(self, tmp_path):
+        """The whole train_condition path with augment_on_device forced on (CPU)."""
+        import pickle
+        import numpy as np
+        from pvc_dlif.data import pkl_io
+        from pvc_dlif.dlif.dataset import make_folds
+        from pvc_dlif.dlif.train import TrainSettings, train_condition
+        import torch.nn as nn
+
+        ids = [f"S{i}" for i in range(6)]
+        data = tmp_path / "data"; (data / "AIF_SUV").mkdir(parents=True)
+        for scan in ids:
+            pkl_io.save_img(data, scan, np.random.rand(42, 8, 8, 8).astype(np.float64), np.arange(42.0),
+                            shape=(8, 8, 8))
+            with open(data / "AIF_SUV" / f"AIF_{scan}.pkl", "wb") as f:
+                pickle.dump({"AIF_A_int": np.random.rand(42), "AIF_t_int": np.arange(42.0)}, f)
+
+        class Tiny(nn.Module):
+            def __init__(self):
+                super().__init__(); self.lin = nn.Linear(8 * 8 * 8, 1)
+            def forward(self, x):                      # (B, C, T, Z, Y, X) -> (B, T)
+                return self.lin(x[:, 0].flatten(2)).squeeze(-1)
+
+        settings = TrainSettings(epochs=2, batch_size=3, device="cpu", amp=False)
+        results = train_condition(
+            model_factory=Tiny, data_root=data, aif_root=data, scan_ids=ids,
+            group_of={s: None for s in ids}, out_dir=tmp_path / "models", settings=settings,
+            n_folds=2, n_runs=1, validation_size=0.34, img_shape=(8, 8, 8),
+            augmentation={"poisson_noise": True, "random_flip": True, "add_average": False},
+            seed=1, resume=False, folds=make_folds(ids, 2, 1), augment_on_device=True,
+        )
+        assert len(results) == 2 and all(r.epochs_trained == 2 for r in results)

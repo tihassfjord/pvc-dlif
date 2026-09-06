@@ -170,7 +170,39 @@ def _build_loss(settings: TrainSettings):
     raise ValueError(f"Unsupported loss {settings.loss!r}")
 
 
-def _epoch(model, loader, criterion, device, optimizer=None, scaler=None, amp: bool = False) -> float:
+def augment_on_device(inputs, generator, poisson_noise: bool, random_flip: bool,
+                      add_average: bool, start_frame: int = 35):
+    """The group's augmentation, applied to a batch already on the GPU.
+
+    ``inputs`` is ``(B, 1, T, Z, Y, X)``.  Per sample: a scale drawn from
+    U(0, 1) sets the Poisson rate from the voxel values, the noise added is
+    ``Poisson(rate) - rate`` (zero mean), then an in-plane flip with p = 0.5;
+    finally the late-frame average is stacked as a second channel if the model
+    takes one.  Same distribution as the NumPy path in ``DlifDataset._augment``
+    and the group's ``add_poisson_noise`` / ``apply_augmentations``, just not
+    on the CPU: this is what turns a 40 s epoch into a 2 s one.
+    """
+    import torch
+
+    x = inputs
+    if poisson_noise:
+        batch = x.shape[0]
+        scale = torch.rand(batch, 1, 1, 1, 1, 1, device=x.device, generator=generator)
+        rate = (x * scale).clamp_min_(0.0)
+        x = x + (torch.poisson(rate, generator=generator) - rate)
+    if random_flip:
+        flip = torch.rand(x.shape[0], device=x.device, generator=generator) < 0.5
+        if bool(flip.any()):
+            x = x.clone()
+            x[flip] = torch.flip(x[flip], dims=(-1, -2))
+    if add_average:
+        late = x[:, :1, start_frame:].mean(dim=2, keepdim=True).expand(-1, -1, x.shape[2], -1, -1, -1)
+        x = torch.cat([x, late], dim=1)
+    return x
+
+
+def _epoch(model, loader, criterion, device, optimizer=None, scaler=None, amp: bool = False,
+           device_aug: dict | None = None, generator=None) -> float:
     import torch
 
     training = optimizer is not None
@@ -180,6 +212,14 @@ def _epoch(model, loader, criterion, device, optimizer=None, scaler=None, amp: b
     for batch in loader:
         inputs = batch["INPUT"].to(device, dtype=torch.float32, non_blocking=True)
         targets = batch["AIF"].to(device, dtype=torch.float32, non_blocking=True)
+        if device_aug is not None:
+            # Validation gets the average channel but no noise or flips.
+            inputs = augment_on_device(
+                inputs, generator,
+                poisson_noise=training and device_aug["poisson_noise"],
+                random_flip=training and device_aug["random_flip"],
+                add_average=device_aug["add_average"],
+            )
 
         with torch.set_grad_enabled(training):
             if amp and device.startswith("cuda"):
@@ -238,6 +278,17 @@ def train_one_run(
     criterion = _build_loss(settings)
     scaler = torch.amp.GradScaler("cuda") if (settings.amp and device.startswith("cuda")) else None
 
+    # Augmentation on the GPU when there is one (see augment_on_device); the
+    # datasets were told to hand out raw images in that case.
+    device_aug = None
+    generator = None
+    if getattr(train_dataset, "augment_on_device", False):
+        device_aug = {"poisson_noise": train_dataset.poisson_noise,
+                      "random_flip": train_dataset.random_flip,
+                      "add_average": train_dataset.add_average}
+        generator = torch.Generator(device=device)
+        generator.manual_seed(int(seed))
+
     history: dict[str, list[float]] = {"train_loss": [], "val_loss": [], "lr": []}
     best_loss, best_epoch, stale = float("inf"), -1, 0
     checkpoint_path = Path(checkpoint_path)
@@ -247,8 +298,9 @@ def train_one_run(
     progress_path = checkpoint_path.with_name("progress.json")
 
     for epoch in range(settings.epochs):
-        train_loss = _epoch(model, train_loader, criterion, device, optimizer, scaler, settings.amp)
-        val_loss = _epoch(model, val_loader, criterion, device)
+        train_loss = _epoch(model, train_loader, criterion, device, optimizer, scaler, settings.amp,
+                            device_aug=device_aug, generator=generator)
+        val_loss = _epoch(model, val_loader, criterion, device, device_aug=device_aug, generator=generator)
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
@@ -361,8 +413,13 @@ def train_condition(
     seed: int = 42,
     resume: bool = True,
     folds: Sequence[Fold] | None = None,
+    augment_on_device: bool | None = None,
 ) -> list[RunResult]:
     """Run the full cross-validated training protocol for one condition.
+
+    ``augment_on_device`` moves the Poisson-noise/flip augmentation (and the
+    average channel) onto the training device.  ``None`` means "when that
+    device is a GPU", which is the only case where it is faster.
 
     ``model_factory`` is called for every run and returns a fresh model, either
     randomly initialised (retraining) or preloaded with the pretrained weights
@@ -383,6 +440,10 @@ def train_condition(
 
     # One in-memory copy of every scan for this condition, shared by all runs.
     shared_cache: dict = {}
+    if augment_on_device is None:
+        augment_on_device = settings.resolve_device().startswith("cuda")
+    if augment_on_device:
+        LOGGER.info("augmentation runs on the training device")
 
     results: list[RunResult] = []
     total_jobs = len(folds) * n_runs
@@ -413,12 +474,12 @@ def train_condition(
                 poisson_noise=bool(augmentation.get("poisson_noise", True)),
                 random_flip=bool(augmentation.get("random_flip", True)),
                 add_average=bool(augmentation.get("add_average", False)),
-                seed=run_seed, cache=shared_cache,
+                seed=run_seed, cache=shared_cache, augment_on_device=augment_on_device,
             )
             val_dataset = DlifDataset(
                 data_root, val_ids, aif_root, img_shape, mode="val", augment=False,
                 add_average=bool(augmentation.get("add_average", False)), seed=run_seed,
-                cache=shared_cache,
+                cache=shared_cache, augment_on_device=augment_on_device,
             )
 
             eta = ""

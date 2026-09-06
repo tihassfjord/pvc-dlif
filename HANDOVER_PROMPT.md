@@ -228,7 +228,9 @@ Drive a complete run and fix what breaks. Known risks:
 - **Stage 05 cost.** 3 retrained conditions × 10 folds × 10 runs = **300 trainings** of
   1000 epochs each (the published protocol; an earlier config said 300). Every scan is held
   in RAM per condition (~2.6 GB for 70) — without that, an epoch was disk-bound at 28 s on
-  the owner's machine. Each run writes `progress.json` every epoch; the Pipeline tab shows
+  the owner's machine — and on a GPU the Poisson/flip augmentation runs on the device
+  (`train.augment_on_device`), because NumPy Poisson over 9 M voxels per scan is ~0.8 s and
+  would keep the GPU idle for 40 s per epoch. Expect a few seconds per epoch, not tens. Each run writes `progress.json` every epoch; the Pipeline tab shows
   the current epoch, s/epoch, ETA and how long ago it last updated, so "slow" and "dead" can
   be told apart. Pilot checkpoints (5 epochs) are recognised as incomplete and retrained;
   stage 06 re-predicts from checkpoints by default rather than reusing a cached table. Not
