@@ -1102,14 +1102,12 @@ class TestDeviceAugmentation:
             def forward(self, x):                      # (B, C, T, Z, Y, X) -> (B, T)
                 return self.lin(x[:, 0].flatten(2)).squeeze(-1)
 
-        for placement in ("host", "device", "loader"):
-            settings = TrainSettings(epochs=2, batch_size=3, device="cpu", amp=False,
-                                     data_placement=placement)
-            results = train_condition(
-                model_factory=Tiny, data_root=data, aif_root=data, scan_ids=ids,
-                group_of={s: None for s in ids}, out_dir=tmp_path / f"models_{placement}",
-                settings=settings, n_folds=2, n_runs=1, validation_size=0.34, img_shape=(8, 8, 8),
-                augmentation={"poisson_noise": True, "random_flip": True, "add_average": False},
-                seed=1, resume=False, folds=make_folds(ids, 2, 1), augment_on_device=True,
-            )
-            assert len(results) == 2 and all(r.epochs_trained == 2 for r in results), placement
+        settings = TrainSettings(epochs=2, batch_size=3, device="cpu", amp=False)
+        results = train_condition(
+            model_factory=Tiny, data_root=data, aif_root=data, scan_ids=ids,
+            group_of={s: None for s in ids}, out_dir=tmp_path / "models", settings=settings,
+            n_folds=2, n_runs=1, validation_size=0.34, img_shape=(8, 8, 8),
+            augmentation={"poisson_noise": True, "random_flip": True, "add_average": False},
+            seed=1, resume=False, folds=make_folds(ids, 2, 1), augment_on_device=True,
+        )
+        assert len(results) == 2 and all(r.epochs_trained == 2 for r in results)

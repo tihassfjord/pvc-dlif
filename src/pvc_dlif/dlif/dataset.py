@@ -199,15 +199,6 @@ class DlifDataset:
     def __len__(self) -> int:
         return len(self.scan_ids)
 
-    def raw(self, index: int) -> tuple[str, np.ndarray, np.ndarray]:
-        """``(scan_id, image, aif)`` without any copy - for building resident tensors."""
-        scan_id = self.scan_ids[index]
-        cached = self._cache.get(scan_id)
-        if cached is None:
-            cached = self._read(scan_id)
-            self._cache[scan_id] = cached
-        return scan_id, cached[0], cached[1]
-
     def _read(self, scan_id: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         image, _ = pkl_io.load_img(self.data_root, scan_id, self.img_shape)
         aif, times = pkl_io.load_aif(self.aif_root, scan_id)
