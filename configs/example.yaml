@@ -270,6 +270,12 @@ dlif:
     monitor: val_loss
     device: cuda
     amp: true
+    # Where the training set lives during a run on a GPU: "host" (pinned RAM,
+    # one transfer per batch - the safe default), "device" (resident in VRAM;
+    # only with plenty of memory - a full GPU on Windows spills to system
+    # memory silently and an epoch takes a minute), or "loader" (the plain
+    # DataLoader path, slower).
+    data_placement: host
   finetune:
     # Used when mode == "finetune" instead of "retrain": start from the
     # pretrained weights and train with a reduced learning rate.

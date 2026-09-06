@@ -66,6 +66,13 @@ class TrainSettings:
     device: str = "cuda"
     amp: bool = True
     num_workers: int = 0
+    # Where the training set lives during a run (device path only):
+    #   "host"   - one pinned tensor in RAM, one async transfer per batch (default)
+    #   "device" - resident on the GPU; only if VRAM is plentiful.  On Windows a
+    #              full GPU does not raise, it silently spills to system memory
+    #              over PCIe and an epoch goes from seconds to a minute.
+    #   "loader" - the plain DataLoader path (the slow, copy-heavy one)
+    data_placement: str = "host"
 
     @classmethod
     def from_config(cls, config, finetune: bool = False) -> "TrainSettings":
@@ -87,6 +94,7 @@ class TrainSettings:
             monitor=str(train.get("monitor", "val_loss")),
             device=str(train.get("device", "cuda")),
             amp=bool(train.get("amp", True)),
+            data_placement=str(train.get("data_placement", "host")),
         )
         if finetune:
             ft = dict(config.get("dlif.finetune", {}))
@@ -214,7 +222,7 @@ class ResidentBatches:
     """
 
     def __init__(self, dataset, device: str, generator, batch_size: int, shuffle: bool,
-                 activation_margin_gb: float = 3.0):
+                 placement: str = "host", activation_margin_gb: float = 3.0):
         import torch
 
         # Fill a preallocated tensor straight from the dataset cache: one copy
@@ -238,13 +246,16 @@ class ResidentBatches:
         self.where = "host"
 
         if device.startswith("cuda"):
-            free, _total = torch.cuda.mem_get_info(torch.device(device))
-            need32 = x.numel() * 4 + activation_margin_gb * 1024 ** 3
-            need16 = x.numel() * 2 + activation_margin_gb * 1024 ** 3
-            if free > need32:
-                x = x.to(device); self.where = "device float32"
-            elif free > need16:
-                x = x.to(device, dtype=torch.float16); self.where = "device float16"
+            if placement == "device":
+                free, _total = torch.cuda.mem_get_info(torch.device(device))
+                need32 = x.numel() * 4 + activation_margin_gb * 1024 ** 3
+                need16 = x.numel() * 2 + activation_margin_gb * 1024 ** 3
+                if free > need32:
+                    x = x.to(device); self.where = "device float32"
+                elif free > need16:
+                    x = x.to(device, dtype=torch.float16); self.where = "device float16"
+                else:
+                    x = x.pin_memory(); self.where = "pinned host"
             else:
                 x = x.pin_memory(); self.where = "pinned host"
             y = y.to(device)
@@ -338,13 +349,18 @@ def train_one_run(
     device = settings.resolve_device()
     model = model.to(device)
 
-    resident = getattr(train_dataset, "augment_on_device", False)
-    if resident:
-        # Everything on the device; the generator is created below and shared.
+    on_device_aug = getattr(train_dataset, "augment_on_device", False)
+    resident = on_device_aug and settings.data_placement != "loader"
+    # One generator per run drives shuffling and the on-device augmentation.
+    generator = None
+    if on_device_aug:
         generator = torch.Generator(device=device if device.startswith("cuda") else "cpu")
         generator.manual_seed(int(seed))
-        train_loader = ResidentBatches(train_dataset, device, generator, settings.batch_size, shuffle=True)
-        val_loader = ResidentBatches(val_dataset, device, generator, settings.batch_size, shuffle=False)
+    if resident:
+        train_loader = ResidentBatches(train_dataset, device, generator, settings.batch_size, shuffle=True,
+                                       placement=settings.data_placement)
+        val_loader = ResidentBatches(val_dataset, device, generator, settings.batch_size, shuffle=False,
+                                     placement=settings.data_placement)
         LOGGER.info("  data resident: train %s, val %s", train_loader.where, val_loader.where)
     else:
         train_loader = DataLoader(
@@ -364,12 +380,10 @@ def train_one_run(
     # Augmentation on the GPU when there is one (see augment_on_device); the
     # datasets were told to hand out raw images in that case.
     device_aug = None
-    if resident:
+    if on_device_aug:
         device_aug = {"poisson_noise": train_dataset.poisson_noise,
                       "random_flip": train_dataset.random_flip,
                       "add_average": train_dataset.add_average}
-    else:
-        generator = None
 
     history: dict[str, list[float]] = {"train_loss": [], "val_loss": [], "lr": []}
     best_loss, best_epoch, stale = float("inf"), -1, 0
