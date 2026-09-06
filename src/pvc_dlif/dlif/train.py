@@ -201,6 +201,80 @@ def augment_on_device(inputs, generator, poisson_noise: bool, random_flip: bool,
     return x
 
 
+class ResidentBatches:
+    """The whole set as one tensor, batches gathered by index - no host copies.
+
+    Every epoch of the DataLoader path copies each scan four or five times on
+    the CPU (item copy, contiguous copy, collate, pin, transfer): ~2 GB of
+    memcpy plus a PCIe transfer per epoch, several seconds with the GPU idle.
+    Here the stacked tensor lives on the training device when it fits (checked
+    against free memory with a margin for activations), else half precision on
+    the device, else pinned host memory; a batch is then a gather on the device
+    or one asynchronous transfer.  Shuffling uses the run's generator.
+    """
+
+    def __init__(self, dataset, device: str, generator, batch_size: int, shuffle: bool,
+                 activation_margin_gb: float = 3.0):
+        import torch
+
+        # Fill a preallocated tensor straight from the dataset cache: one copy
+        # of the data, not three (item copy + stack + tensor) - the peak memory
+        # of a 70-scan condition is then ~2.6 GB, not ~8 GB.
+        n = len(dataset)
+        first_id, first_img, first_aif = dataset.raw(0)
+        x = torch.empty((n, 1, *first_img.shape), dtype=torch.float32)
+        y = torch.empty((n, *first_aif.shape), dtype=torch.float32)
+        self.ids = []
+        for i in range(n):
+            scan_id, img, aif = dataset.raw(i)
+            x[i, 0].copy_(torch.from_numpy(np.ascontiguousarray(img, dtype=np.float32)))
+            y[i].copy_(torch.from_numpy(np.asarray(aif, dtype=np.float32)))
+            self.ids.append(scan_id)
+        self.n = n
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.generator = generator
+        self.device = device
+        self.where = "host"
+
+        if device.startswith("cuda"):
+            free, _total = torch.cuda.mem_get_info(torch.device(device))
+            need32 = x.numel() * 4 + activation_margin_gb * 1024 ** 3
+            need16 = x.numel() * 2 + activation_margin_gb * 1024 ** 3
+            if free > need32:
+                x = x.to(device); self.where = "device float32"
+            elif free > need16:
+                x = x.to(device, dtype=torch.float16); self.where = "device float16"
+            else:
+                x = x.pin_memory(); self.where = "pinned host"
+            y = y.to(device)
+        self.x, self.y = x, y
+
+    def to_host(self) -> None:
+        """Move the data off the device (after an out-of-memory during training)."""
+        if self.x.is_cuda:
+            self.x = self.x.float().cpu().pin_memory()
+            self.where = "pinned host (after OOM)"
+
+    def __len__(self) -> int:
+        return (self.n + self.batch_size - 1) // self.batch_size
+
+    def __iter__(self):
+        import torch
+
+        if self.shuffle:
+            order = torch.randperm(self.n, generator=self.generator, device=self.x.device
+                                   if self.x.is_cuda else "cpu")
+        else:
+            order = torch.arange(self.n, device=self.x.device if self.x.is_cuda else "cpu")
+        for start in range(0, self.n, self.batch_size):
+            idx = order[start:start + self.batch_size]
+            xb = self.x[idx]
+            if not xb.is_cuda:
+                xb = xb.to(self.device, non_blocking=True)
+            yield {"INPUT": xb.float(), "AIF": self.y[idx.to(self.y.device)]}
+
+
 def _epoch(model, loader, criterion, device, optimizer=None, scaler=None, amp: bool = False,
            device_aug: dict | None = None, generator=None) -> float:
     import torch
@@ -264,14 +338,23 @@ def train_one_run(
     device = settings.resolve_device()
     model = model.to(device)
 
-    train_loader = DataLoader(
-        train_dataset.as_torch(), batch_size=settings.batch_size, shuffle=True,
-        num_workers=settings.num_workers, pin_memory=device.startswith("cuda"), drop_last=False,
-    )
-    val_loader = DataLoader(
-        val_dataset.as_torch(), batch_size=settings.batch_size, shuffle=False,
-        num_workers=settings.num_workers, pin_memory=device.startswith("cuda"),
-    )
+    resident = getattr(train_dataset, "augment_on_device", False)
+    if resident:
+        # Everything on the device; the generator is created below and shared.
+        generator = torch.Generator(device=device if device.startswith("cuda") else "cpu")
+        generator.manual_seed(int(seed))
+        train_loader = ResidentBatches(train_dataset, device, generator, settings.batch_size, shuffle=True)
+        val_loader = ResidentBatches(val_dataset, device, generator, settings.batch_size, shuffle=False)
+        LOGGER.info("  data resident: train %s, val %s", train_loader.where, val_loader.where)
+    else:
+        train_loader = DataLoader(
+            train_dataset.as_torch(), batch_size=settings.batch_size, shuffle=True,
+            num_workers=settings.num_workers, pin_memory=device.startswith("cuda"), drop_last=False,
+        )
+        val_loader = DataLoader(
+            val_dataset.as_torch(), batch_size=settings.batch_size, shuffle=False,
+            num_workers=settings.num_workers, pin_memory=device.startswith("cuda"),
+        )
 
     optimizer = _build_optimizer(model, settings)
     scheduler = _build_scheduler(optimizer, settings)
@@ -281,13 +364,12 @@ def train_one_run(
     # Augmentation on the GPU when there is one (see augment_on_device); the
     # datasets were told to hand out raw images in that case.
     device_aug = None
-    generator = None
-    if getattr(train_dataset, "augment_on_device", False):
+    if resident:
         device_aug = {"poisson_noise": train_dataset.poisson_noise,
                       "random_flip": train_dataset.random_flip,
                       "add_average": train_dataset.add_average}
-        generator = torch.Generator(device=device)
-        generator.manual_seed(int(seed))
+    else:
+        generator = None
 
     history: dict[str, list[float]] = {"train_loss": [], "val_loss": [], "lr": []}
     best_loss, best_epoch, stale = float("inf"), -1, 0
@@ -298,8 +380,20 @@ def train_one_run(
     progress_path = checkpoint_path.with_name("progress.json")
 
     for epoch in range(settings.epochs):
-        train_loss = _epoch(model, train_loader, criterion, device, optimizer, scaler, settings.amp,
-                            device_aug=device_aug, generator=generator)
+        try:
+            train_loss = _epoch(model, train_loader, criterion, device, optimizer, scaler, settings.amp,
+                                device_aug=device_aug, generator=generator)
+        except torch.cuda.OutOfMemoryError:
+            # The resident data plus activations did not fit after all: move
+            # the data back to host memory and retry this epoch once.
+            if not (resident and getattr(train_loader, "x", None) is not None and train_loader.x.is_cuda):
+                raise
+            LOGGER.warning("GPU out of memory with the data resident; moving data to host and retrying")
+            train_loader.to_host(); val_loader.to_host()
+            optimizer.zero_grad(set_to_none=True)
+            torch.cuda.empty_cache()
+            train_loss = _epoch(model, train_loader, criterion, device, optimizer, scaler, settings.amp,
+                                device_aug=device_aug, generator=generator)
         val_loss = _epoch(model, val_loader, criterion, device, device_aug=device_aug, generator=generator)
 
         history["train_loss"].append(train_loss)
