@@ -38,7 +38,10 @@ LOGGER = get_logger("stage.retrain")
 def main() -> int:
     parser = base_parser(__doc__ or "")
     parser.add_argument("--conditions", nargs="*", default=None,
-                        help="condition names to train (default: all retrained conditions)")
+                        help="condition names to train (default: the non-motion retrained conditions)")
+    parser.add_argument("--include-motion", action="store_true",
+                        help="also train conditions marked motion: true (stage 07's exploratory "
+                             "subset; they need motion.affected_ids to be set to mean anything)")
     parser.add_argument("--mode", choices=["retrain", "finetune"], default=None,
                         help="override dlif.finetune.enabled")
     parser.add_argument("--folds", nargs="*", type=int, default=None, help="only these fold indices")
@@ -77,12 +80,22 @@ def main() -> int:
     if args.device:
         settings.device = args.device
 
-    conditions = [
-        c for c in config.conditions
-        if c.model == "retrained" and (args.conditions is None or c.name in set(args.conditions))
-    ]
+    conditions = config.retrained_conditions(
+        include_motion=args.include_motion, names=args.conditions,
+    )
     if not conditions:
         raise SystemExit("No retrained conditions selected")
+    chosen = {c.name for c in conditions}
+    skipped = [
+        c.name for c in config.conditions
+        if c.model == "retrained" and c.motion and c.name not in chosen
+    ]
+    if skipped:
+        LOGGER.info(
+            "skipping motion conditions (%s) - they are stage 07's subset; "
+            "use --include-motion to train them here",
+            ", ".join(skipped),
+        )
 
     n_folds = int(config.get("dlif.cv.n_folds", 10))
     n_runs = args.runs if args.runs is not None else int(config.get("dlif.cv.n_runs", 10))
@@ -124,10 +137,15 @@ def main() -> int:
         "Fine-tuning" if finetune else "Retraining",
         len(conditions), len(base_ids), len(folds), n_runs, settings.epochs, settings.resolve_device(),
     )
+    LOGGER.info(
+        "training regime: %s (lr %g, loss %s, %d epochs, %d folds x %d runs)",
+        config.regime, settings.learning_rate, settings.loss, settings.epochs, len(folds), n_runs,
+    )
 
     if args.dry_run:
         print(json.dumps(
             {
+                "regime": config.regime,
                 "conditions": [c.name for c in conditions],
                 "n_scans": len(base_ids),
                 "folds": [f.index for f in folds],

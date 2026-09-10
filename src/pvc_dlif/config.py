@@ -100,7 +100,54 @@ class Config:
     def __init__(self, raw: Mapping[str, Any], source: Path | None = None):
         self.raw: dict[str, Any] = copy.deepcopy(dict(raw))
         self.source = source
+        self.regime: str = self._apply_regime()
         self._validate()
+
+    # ------------------------------------------------------------------ #
+    # training regime
+    # ------------------------------------------------------------------ #
+    def _apply_regime(self) -> str:
+        """Merge the selected training regime into ``dlif.cv`` and ``dlif.train``.
+
+        The two DLIF papers train the same family of model very differently:
+        Kuttner et al. 2024 uses 17-fold cross-validation, one run per fold,
+        200 epochs at 2e-4 with a plain MSE loss; the 2026 protocol uses 10
+        folds, 10 runs, 1000 epochs at 1e-4 with a weighted MSE.  Which one
+        applies is a study-design decision, not a hyperparameter to tune, so it
+        is named once here and the merge happens at load: every existing reader
+        of ``dlif.cv.*`` and ``dlif.train.*`` then sees the resolved values and
+        the provenance record shows what was actually used.
+
+        A regime patch only overrides the keys it names, so anything the
+        published protocol does not speak to (device, amp, num_workers) keeps
+        the base value.
+        """
+        dlif = self.raw.get("dlif")
+        if not isinstance(dlif, Mapping):
+            return "base"
+        name = dlif.get("regime")
+        if name is None:
+            return "base"
+
+        name = str(name)
+        regimes = dlif.get("regimes") or {}
+        if name not in regimes:
+            known = ", ".join(sorted(str(k) for k in regimes)) or "none defined"
+            raise ValueError(
+                f"dlif.regime is '{name}' but no such regime exists. Known: {known}"
+            )
+
+        patch = regimes[name] or {}
+        for section in ("cv", "train"):
+            values = patch.get(section)
+            if not isinstance(values, Mapping):
+                continue
+            target = self.raw["dlif"].setdefault(section, {})
+            if not isinstance(target, dict):
+                target = {}
+                self.raw["dlif"][section] = target
+            target.update(copy.deepcopy(dict(values)))
+        return name
 
     # ------------------------------------------------------------------ #
     # generic access
@@ -289,6 +336,31 @@ class Config:
         """
         primary = self.iterations_primary
         return [Condition.from_dict(c, default_iterations=primary) for c in self.get("conditions", [])]
+
+    def retrained_conditions(
+        self,
+        *,
+        include_motion: bool = False,
+        names: Iterable[str] | None = None,
+    ) -> list[Condition]:
+        """The conditions stage 05 trains, and that stage 06 then compares.
+
+        Motion conditions are excluded by default.  They belong to stage 07:
+        they are exploratory, they are scored on the motion-affected subset
+        rather than the whole cohort, and stage 05 has no notion of ``subset``,
+        so training them with the main grid would silently fit them to every
+        scan.  Naming one explicitly still selects it.
+
+        Stage 05 and the status report must agree on this set, or the progress
+        fraction counts a different grid from the one being trained.
+        """
+        wanted = set(names) if names is not None else None
+        return [
+            c for c in self.conditions
+            if c.model == "retrained"
+            and (wanted is None or c.name in wanted)
+            and (not c.motion or include_motion or wanted is not None)
+        ]
 
     def condition(self, name: str) -> Condition:
         for cond in self.conditions:

@@ -80,11 +80,11 @@ class SetupTab(ttk.Frame):
         row2 = ttk.Frame(params)
         row2.pack(fill="x", pady=2)
         self.folds = LabelledEntry(row2, "CV folds", 10, width=5,
-                                   tooltip="dlif.cv.n_folds. 10 is the published protocol.")
+                                   tooltip="dlif.cv.n_folds. 17 in the 2024 regime, 10 in 2026.")
         self.folds.pack(side="left")
         self.runs = LabelledEntry(row2, "Runs per fold", 10, width=5,
                                   tooltip="dlif.cv.n_runs - repeats that feed the variance term. "
-                                          "3 gives a directional answer sooner.")
+                                          "1 in the 2024 regime, 10 in 2026.")
         self.runs.pack(side="left", padx=14)
         ttk.Label(row2, text="Device").pack(side="left")
         self.device = tk.StringVar(value="cuda")
@@ -92,6 +92,12 @@ class SetupTab(ttk.Frame):
                                   values=("cuda", "cpu"))
         device_box.pack(side="left", padx=4)
         ToolTip(device_box, "dlif.train.device. Stage 05 on CPU is not realistic.")
+        self.regime_label = ttk.Label(row2, text="", foreground="#555")
+        self.regime_label.pack(side="left", padx=(18, 0))
+        ToolTip(self.regime_label,
+                "dlif.regime - which published training protocol stage 05 reproduces. "
+                "It sets epochs, learning rate, loss, folds and runs together, and the "
+                "two fields to the left edit the active one. Change it in the YAML.")
 
         row3 = ttk.Frame(params)
         row3.pack(fill="x", pady=2)
@@ -158,6 +164,15 @@ class SetupTab(ttk.Frame):
         self.folds.var.set(str(config.get("dlif.cv.n_folds", 10)))
         self.runs.var.set(str(config.get("dlif.cv.n_runs", 10)))
         self.device.set(str(config.get("dlif.train.device", "cuda")))
+        if config.regime == "base":
+            self.regime_label.configure(text="no regime set")
+        else:
+            self.regime_label.configure(
+                text=f"regime {config.regime}:  "
+                     f"{config.get('dlif.train.epochs')} epochs, "
+                     f"lr {config.get('dlif.train.learning_rate')}, "
+                     f"{config.get('dlif.train.loss')}"
+            )
         self.motion_ids.var.set(" ".join(str(i) for i in config.get("motion.affected_ids", [])))
         self.save_status.configure(text="loaded", foreground="#555")
         del raw

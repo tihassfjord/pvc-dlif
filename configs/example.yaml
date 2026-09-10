@@ -241,9 +241,51 @@ dlif:
     in_channels: 1
     add_average: false
 
+  # ------------------------------------------------------------------
+  # Which published training regime to reproduce.
+  #
+  # The project description, step 3, requires retraining "using the same
+  # cross-validation scheme, hyperparameters and stopping criteria as the
+  # baseline model so that the comparison isolates the input representation",
+  # and step 2 defines the baseline as the pretrained model of Kuttner et al.,
+  # Frontiers in Nuclear Medicine 4 (2024).  So "2024" is the regime the
+  # signed description asks for; "2026" is the later EJNMMI Research protocol,
+  # which is what the upstream repository's config.yaml carries today.
+  #
+  # This is a design decision, not a tuning knob.  Set it once, record which
+  # one was used, and do not mix values from the two.
+  # ------------------------------------------------------------------
+  regime: "2024"
+  regimes:
+    # Kuttner et al., Frontiers in Nuclear Medicine 4 (2024).
+    # 17-fold CV over 68 scans (64 train / 4 test per fold), one run per fold,
+    # 200 epochs, Adam at 2e-4, plain MSE, no scheduler, no early stopping.
+    "2024":
+      cv:
+        n_folds: 17
+        n_runs: 1
+      train:
+        epochs: 200
+        learning_rate: 0.0002
+        loss: MSELoss
+        use_scheduler: false
+        early_stopping: false
+    # Kuttner et al., EJNMMI Research (2026), and upstream src/config.yaml.
+    # 10-fold CV, 10 runs per fold, 1000 epochs, Adam at 1e-4, weighted MSE.
+    "2026":
+      cv:
+        n_folds: 10
+        n_runs: 10
+      train:
+        epochs: 1000
+        learning_rate: 0.0001
+        loss: WeightedMSELoss
+        use_scheduler: false
+        early_stopping: false
+
   cv:
     n_folds: 10
-    n_runs: 10               # repeats per fold, as in the baseline protocol
+    n_runs: 10               # overridden by the regime above
     validation_size: 0.15
     stratify_by: group       # keys of datahandlers/shared_dicts.groups
   train:

@@ -183,7 +183,7 @@ def stage_statuses(config: Config) -> list[StageStatus]:
                                 "predictions/pretrained" if has_pre else ""))
 
     # 05 - folds x runs x retrained conditions, each leaving a summary.json
-    retrained = [c for c in config.conditions if c.model == "retrained" and not c.motion]
+    retrained = config.retrained_conditions()
     folds = int(config.get("dlif.cv.n_folds", 10))
     runs = int(config.get("dlif.cv.n_runs", 10))
     trainings_done = sum(
