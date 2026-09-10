@@ -1,21 +1,118 @@
-# Task: drive the first real run of the pvc-dlif pipeline
+# Task: finish the pvc-dlif study
 
 You are taking over a working research repository for a master's thesis (FYS-3941, UiT).
 The owner is a physics student who knows Python and reads code comfortably — he is not
 afraid of the source, he just doesn't want to type long command lines dozens of times while
 producing thesis data.
 
-**The code is complete and tested; what has never happened is a full run on the real data.**
-The GUI specified in section 5 is built and verified headlessly. The remaining work is:
+**The pipeline has now been run on the real data through stage 05.** Stages 00–04 are done
+on all 70 usable scans; stage 05 is running on the UiT Springfield GPU cluster. What remains
+is stages 06–08 and the writing. Read section 0 for the live state, then sections 2, 3 and 8
+before writing code — they exist to stop you re-deriving things that already cost days, and
+to stop you silently breaking the science.
 
-1. **Install what the owner's machine lacks** — PETPVC, and a CUDA build of torch — which the
-   GUI's preflight page lists with the fix for each.
-2. **Drive the first full run on the real 70-scan dataset** and fix what surfaces. Expect
-   scale problems (memory, runtime, disk), not logic problems.
-3. Only then, anything on the GUI that the real run shows to be missing.
+---
 
-Read sections 2, 3 and 8 before writing code. They exist to stop you re-deriving things that
-already cost days, and to stop you silently breaking the science.
+## 0. Live state — updated 2026-09-10
+
+### Where the study stands
+
+| Stage | State |
+|---|---|
+| 00 inventory | done — 70 usable of 102 scans |
+| 01 convert + window fit | done — **70 of 70 match the distributed inputs exactly** |
+| 02 PVC (RL, RVC) | done — 70 scans x 2 methods, native resolution |
+| 03 network inputs | done — three trees: `orig`, `rl_i15`, `rvc_i15` |
+| 04 pretrained inference | done |
+| 05 retrain | **running on Springfield**, see below |
+| 06 evaluate | not started |
+| 07 motion subset | blocked — needs the affected-scan list from C. Salomonsen |
+| 08 report | not started |
+
+### Decisions taken this week
+
+**The training regime is selected in the config, not hardcoded.** `dlif.regime` picks between
+`"2024"` (Kuttner et al., Frontiers in Nuclear Medicine 4, 2024: 17 folds, 1 run, 200 epochs,
+lr 2e-4, plain MSE) and `"2026"` (EJNMMI Research: 10 folds, 10 runs, 1000 epochs, lr 1e-4,
+weighted MSE). The patch is merged into `dlif.cv` and `dlif.train` at load, so every reader
+sees resolved values and the provenance record shows which was used.
+
+**The study runs the 2026 regime on `DLIFNet_MAX`.** The reasoning: `DLIFNet` cannot be built
+from the upstream repo as it stands — `Encoder` outputs 32 channels and `DLIFNet`'s bottleneck
+`Conv3d` expects 128, so only `DLIFNet_MAX` runs. The 2024 architecture exists only inside the
+pickled `DLIFNet.pt`, reachable by unpickling and re-initialising the weights. Rather than do
+that, the study uses one architecture consistently with the protocol it was tuned for. Awaiting
+Samuel's confirmation (asked on Slack).
+
+**The pretrained condition is reported on its own terms, not differenced against the retrained
+one.** Since the retrained conditions use a different architecture from `DLIFNet.pt`, the
+`retrained − pretrained` decomposition in step 3 of the project description would mix an
+architecture difference into the result. The three retrained conditions share an architecture,
+so the main hypothesis is unaffected. **Stage 06 must not compute that decomposition** — this
+is a change from the project description and belongs in the limitations.
+
+**1000 epochs is right for this model, empirically.** Across the first 85 completed runs:
+median best epoch 917 of 1000, IQR 720–974, 62 of 85 peaking after epoch 750, and the last 250
+epochs improving on the first 750 in 62 of 85 runs (median +6.1 %). Best-val-loss checkpoint
+selection, not last epoch. Median best val loss 0.2374 (IQR 0.195–0.295).
+
+### Two bugs fixed this week — do not reintroduce
+
+**PETPVC calls reblurred Van Cittert `VC`, not `RVC`.** `PETPVC_METHOD_CODE` in
+`pvc/deconvolution.py` maps the study's names to the toolbox's. The thesis text was wrong too
+and has been corrected.
+
+**The crop window may run off the end of the reconstruction, and the group's own windows do.**
+Seven scans needed a 96-slice axial window starting 1–8 slices too late to fit in a 128-slice
+volume; the distributed inputs carry exact zeros there. `crop_with_zero_padding` in `data/grid.py`
+pads rather than shortening — a shortened window would be resampled back up and the input would
+no longer be reconstruction voxels — and `fit_offset_to_reference` widens the search past the
+wall when the optimum lands on it. All 70 scans now match at r = 1.000000, up from 63.
+
+### Stage 05 on the cluster
+
+The bundle from `scripts/cluster/pack_stage05.py` is at `~/stage05_bundle` on Springfield
+(mounted as `/storage/stage05_bundle` inside a job). Submit with:
+
+```bash
+cd /mnt/e/ML4PET/stage05_bundle
+bash run/submit_frink.sh --queue 4 --runs 3     # runs 1-3 everywhere first
+bash run/submit_frink.sh --queue 4              # then top up to 10
+```
+
+`--queue N` writes one Indexed Job that holds N GPUs and refills as pieces finish; the index
+maps to (condition, fold). Monitor with `k9s`, or `kubectl get job pvc-dlif-05` — `frink ls`
+reports completions wrong for indexed jobs.
+
+Cluster facts learned the hard way:
+
+* **The GPU quota is 2 per namespace** (`requests.nvidia.com/gpu=2`). Parallelism above that is
+  harmless — Kubernetes retries — but does nothing until an admin raises it.
+* The CPU quota is 4500m and counts `requests`, not `limits`, so the pods request 500m and
+  limit 2.
+* `backoffLimit` counts failures across all indexes. It is set to 50 because pods get killed
+  with `OutOfnvidia.com/gpu` (exit 137) when the scheduler races the device plugin — three of
+  those ended an otherwise healthy queue eight pieces in.
+* Speed depends entirely on the node: 2.1 s/epoch on flanders (H200), ~10 s on a 2080 Ti,
+  3–4x worse on the 1080 Ti nodes where AMP buys nothing. Do not report a single training time.
+* Files the cluster shell reads must be written with `newline="\n"`; a bundle packed on Windows
+  carried CRLF and `10\r` is not a number to `seq`.
+* `pack_stage05.py` downcasts inputs to float32, which rewrites the pickles with the packing
+  machine's numpy — so `run/requirements.txt` pins the numpy generation that wrote them.
+
+Bring results home with `collect_stage05.py --from <downloaded models>`; it copies only runs
+that finished their epoch budget and reports what is missing.
+
+### Open questions for the supervisors
+
+1. Architecture: `DLIFNet_MAX` with the 1000-epoch protocol, or the 2024 architecture
+   re-initialised from the pickle? (Asked on Slack, unanswered.)
+2. Which scans carry the cyclic inter-frame motion artifact — C. Salomonsen. Stage 07 is
+   blocked without it; `motion.affected_ids` is empty.
+3. Is n = 70 the study's n? The project description says "approximately 94 dynamic scans" and
+   the thesis abstract still says 94.
+4. Does the bias/variance decomposition mean variance over training seeds or over scans? It
+   decides whether `n_runs` must be 10.
 
 ---
 
@@ -134,6 +231,12 @@ different matrix (128 × 120 × 120) but are all excluded.
 
 ## 4. Verification status — be honest about this
 
+> **Superseded by section 0 for the real-data column.** This table records the state
+> before the first real run; stages 00-05 have since been run on the real 70-scan
+> dataset. Kept because the synthetic column still describes what
+> `tests/make_synthetic_dataset.py` exercises, which is how to test a change without
+> the real data.
+
 | Stage | Real data | Synthetic, with the group's real DLIF repo |
 |---|---|---|
 | 00 inventory | ✅ 70/102 usable | ✅ |
@@ -221,6 +324,12 @@ Drive a complete run and fix what breaks. Known risks:
 
 - **Stage 02 scale.** 70 scans × 42 frames × 2 methods. `pvc.workers` parallelises over
   frames; tune it. `--sweep` triples the work and is needed for the sensitivity analysis.
+- **Measure before optimising stage 05.** `scripts/profile_training.py --variants` times
+  each phase of a real epoch (load, transfer, augment, forward, backward, validate) with
+  proper CUDA synchronisation and A/Bs a few safe settings. Two attempts to speed training
+  up by guessing cost the owner a day: one put the data in VRAM and the card silently
+  spilled to system memory (60 s/epoch), the other crashed on a generator/device mismatch.
+  Both were reverted. Profile first.
 - **Stage 05 belongs on a cluster.** `scripts/cluster/` packs a self-contained bundle
   (`pack_stage05.py`), ships SLURM and Kubernetes templates that run one (condition, fold)
   per GPU — the group's own shape — and merges results back (`collect_stage05.py`). See

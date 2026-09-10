@@ -89,7 +89,11 @@ class TestStatus:
         assert by_id["00"].state == "done"
         assert (by_id["01"].done, by_id["01"].total, by_id["01"].state) == (2, 3, "partial")
         assert (by_id["02"].done, by_id["02"].total) == (1, 3)      # only A1 complete
-        assert by_id["05"].total == 3 * 10 * 10                        # conditions x folds x runs
+        # conditions x folds x runs, all three read from the config so that
+        # selecting a different training regime does not break the test.
+        expected = (len(config.retrained_conditions())
+                    * config.get("dlif.cv.n_folds") * config.get("dlif.cv.n_runs"))
+        assert by_id["05"].total == expected
 
     def test_manifest_summary_has_reasons_and_usable_ids(self, config_path):
         config = load_config(config_path)
@@ -144,6 +148,41 @@ class TestConfigEdit:
         out = set_value(text, "pvc.iterations_primary", 20)
         assert "  # why 15\n" in out and "  workers: 4\n" in out
         assert "iterations_primary: 20\n" in out and "trailing" not in out
+
+    def test_repeated_leaf_keys_are_told_apart_by_path(self):
+        """dlif.regimes defines n_runs several times; only dlif.cv.n_runs is meant.
+
+        Matching on the bare key name made every GUI save fail with
+        "occurs 3 times" as soon as the regimes block existed.
+        """
+        text = (
+            "dlif:\n"
+            "  regimes:\n"
+            "    \"2024\":\n"
+            "      cv:\n"
+            "        n_runs: 1\n"
+            "    \"2026\":\n"
+            "      cv:\n"
+            "        n_runs: 10\n"
+            "  cv:\n"
+            "    n_runs: 10\n"
+        )
+        out = set_value(text, "dlif.cv.n_runs", 3)
+        assert out.endswith("  cv:\n    n_runs: 3\n")
+        assert "        n_runs: 1\n" in out          # the 2024 patch is untouched
+        assert set_value(text, 'dlif.regimes.2024.cv.n_runs', 5).count("n_runs: 5") == 1
+
+    def test_an_edit_lands_in_the_active_regime(self, config_path):
+        """A regime overwrites dlif.cv at load, so an edit there would be inert."""
+        from pvc_dlif.config_edit import resolve_key
+
+        config = load_config(config_path)
+        if config.regime == "base":
+            pytest.skip("config defines no regime")
+        assert resolve_key(config, "dlif.cv.n_runs") == \
+            f"dlif.regimes.{config.regime}.cv.n_runs"
+        # A key no regime names stays where it is.
+        assert resolve_key(config, "dlif.train.device") == "dlif.train.device"
 
     def test_save_preserves_comments_and_round_trips(self, config_path):
         before = config_path.read_text(encoding="utf-8").count("\n#")
@@ -325,4 +364,6 @@ class TestClusterBundle:
         assert report["skipped_incomplete_on_cluster"] == [["rl_retrained/fold_01/run_02", 5]]
         assert (config.dir_models / "rl_retrained" / "fold_01" / "run_01" / "model.pt").exists()
         assert not (config.dir_models / "rl_retrained" / "fold_01" / "run_02").exists()
-        assert report["still_missing_count"] == 3 * 10 * 10 - 1
+        grid = (len(config.retrained_conditions())
+                * config.get("dlif.cv.n_folds") * config.get("dlif.cv.n_runs"))
+        assert report["still_missing_count"] == grid - 1

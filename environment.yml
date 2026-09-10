@@ -28,4 +28,4 @@ dependencies:
   - pip:
       # Install the matching CUDA build yourself if you have a GPU; the
       # retraining stage is impractical on CPU.
-      - torch>=2.0
+      # - torch>=2.0

@@ -428,6 +428,52 @@ class TestFolds:
         summary.write_text(json.dumps({"epochs_trained": 60}))
         assert _run_is_complete(summary, TrainSettings(epochs=1000, early_stopping=True, min_epochs=20))[0] is True
 
+    def test_a_longer_run_is_not_a_finished_shorter_one(self, tmp_path):
+        """Switching regime must not silently inherit the other one's models.
+
+        The 2026 regime trains 1000 epochs, the 2024 one 200.  Under a plain
+        ``trained >= epochs`` test every 1000-epoch checkpoint would pass as a
+        finished 200-epoch run and the whole grid would be reused unchanged.
+        """
+        import json
+        from pvc_dlif.dlif.train import TrainSettings, _run_is_complete, protocol_of
+
+        summary = tmp_path / "summary.json"
+        summary.write_text(json.dumps({"epochs_trained": 1000}))
+        complete, why = _run_is_complete(summary, TrainSettings(epochs=200))
+        assert complete is False and "different protocol" in why
+
+    def test_a_recorded_protocol_must_match(self, tmp_path):
+        import json
+        from pvc_dlif.dlif.train import TrainSettings, _run_is_complete, protocol_of
+
+        settings = TrainSettings(epochs=200, learning_rate=2e-4, loss="MSELoss")
+        summary = tmp_path / "summary.json"
+        summary.write_text(json.dumps(
+            {"epochs_trained": 200, "protocol": protocol_of(settings)}))
+        assert _run_is_complete(summary, settings)[0] is True
+
+        # Same epoch budget, different learning rate and loss: not the same run.
+        other = TrainSettings(epochs=200, learning_rate=1e-4, loss="WeightedMSELoss")
+        complete, why = _run_is_complete(summary, other)
+        assert complete is False
+        assert "learning_rate" in why and "loss" in why
+
+    def test_a_different_partition_is_not_reused(self, tmp_path):
+        """n_folds 10 -> 17 renumbers the folds; fold_01 is other scans now."""
+        import json
+        from pvc_dlif.dlif.train import TrainSettings, _run_is_complete
+        from pvc_dlif.dlif.dataset import Fold
+
+        summary = tmp_path / "summary.json"
+        summary.write_text(json.dumps({"epochs_trained": 200, "test_ids": ["A1", "A2"]}))
+        settings = TrainSettings(epochs=200)
+        same = Fold(index=1, train_ids=["B1"], test_ids=["A1", "A2"])
+        assert _run_is_complete(summary, settings, same)[0] is True
+        moved = Fold(index=1, train_ids=["B1"], test_ids=["A3", "A4"])
+        complete, why = _run_is_complete(summary, settings, moved)
+        assert complete is False and "partition" in why
+
     def test_folds_round_trip_through_json(self, tmp_path):
         """Stage 06 must score with the folds stage 05 trained on."""
         import json
@@ -608,6 +654,123 @@ reference_condition: baseline_pretrained
 
         with pytest.raises(ValueError, match="reference_condition"):
             load_config(self._write(tmp_path, "\n"), **{"reference_condition": "nope"})
+
+    def _write_with_retrained(self, tmp_path):
+        """The thesis config's shape: three study conditions plus a motion subset."""
+        path = self._write(tmp_path)
+        text = path.read_text(encoding="utf-8").replace(
+            "reference_condition: baseline_pretrained",
+            "  - {name: baseline_retrained, pvc: null, motion: false, model: retrained}\n"
+            "  - {name: rl_retrained, pvc: {method: RL}, motion: false, model: retrained}\n"
+            "  - {name: rvc_retrained, pvc: {method: RVC}, motion: false, model: retrained}\n"
+            "  - {name: mc_baseline_retrained, pvc: null, motion: true, model: retrained}\n"
+            "  - {name: mc_rl_retrained, pvc: {method: RL}, motion: true, model: retrained}\n"
+            "reference_condition: baseline_retrained",
+        )
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_motion_conditions_are_not_in_the_retraining_grid(self, tmp_path):
+        """Stage 05 trains the study's conditions; motion is stage 07's subset.
+
+        Stage 05 has no notion of `subset`, so a motion condition trained with
+        the main grid is fitted to every scan rather than the affected ones -
+        and it inflates the grid by two conditions x folds x runs.
+        """
+        from pvc_dlif.config import load_config
+
+        cfg = load_config(self._write_with_retrained(tmp_path))
+        assert [c.name for c in cfg.retrained_conditions()] == [
+            "baseline_retrained", "rl_retrained", "rvc_retrained",
+        ]
+
+    def test_motion_conditions_can_be_asked_for(self, tmp_path):
+        from pvc_dlif.config import load_config
+
+        cfg = load_config(self._write_with_retrained(tmp_path))
+        assert len(cfg.retrained_conditions(include_motion=True)) == 5
+        # ... and naming one explicitly overrides the default exclusion.
+        named = cfg.retrained_conditions(names=["mc_rl_retrained"])
+        assert [c.name for c in named] == ["mc_rl_retrained"]
+
+    def test_status_and_stage_05_count_the_same_grid(self, tmp_path):
+        """The GUI's progress fraction must denominate what stage 05 trains.
+
+        These were two separate list comprehensions that had drifted apart:
+        the status report excluded motion conditions and stage 05 did not, so
+        the fraction read 5/30 while 50 trainings were queued.
+        """
+        from pvc_dlif.config import load_config
+        from pvc_dlif.status import stage_statuses
+
+        cfg = load_config(self._write_with_retrained(tmp_path))
+        stage_05 = next(s for s in stage_statuses(cfg) if s.stage_id == "05")
+        expected = len(cfg.retrained_conditions()) * cfg.get("dlif.cv.n_folds", 10) \
+            * cfg.get("dlif.cv.n_runs", 10)
+        assert stage_05.total == expected
+
+    def _write_with_regimes(self, tmp_path, regime: str):
+        path = self._write(tmp_path)
+        text = path.read_text(encoding="utf-8").replace(
+            "dlif: {model_name: DLIFNet_MAX, n_frames: 42}",
+            "dlif:\n"
+            "  model_name: DLIFNet_MAX\n"
+            "  n_frames: 42\n"
+            f"  regime: \"{regime}\"\n"
+            "  regimes:\n"
+            "    \"2024\":\n"
+            "      cv: {n_folds: 17, n_runs: 1}\n"
+            "      train: {epochs: 200, learning_rate: 0.0002, loss: MSELoss}\n"
+            "    \"2026\":\n"
+            "      cv: {n_folds: 10, n_runs: 10}\n"
+            "      train: {epochs: 1000, learning_rate: 0.0001, loss: WeightedMSELoss}\n"
+            "  cv: {n_folds: 10, n_runs: 10, validation_size: 0.15}\n"
+            "  train: {batch_size: 8, device: cpu, amp: false}\n",
+        )
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_regime_2024_overrides_the_base_values(self, tmp_path):
+        """The signed project description asks for the 2024 baseline protocol.
+
+        Selecting it must reach every reader of dlif.cv.* and dlif.train.*,
+        because those are spread across five scripts and the GUI.
+        """
+        from pvc_dlif.config import load_config
+
+        cfg = load_config(self._write_with_regimes(tmp_path, "2024"))
+        assert cfg.regime == "2024"
+        assert cfg.get("dlif.cv.n_folds") == 17
+        assert cfg.get("dlif.cv.n_runs") == 1
+        assert cfg.get("dlif.train.epochs") == 200
+        assert cfg.get("dlif.train.learning_rate") == 0.0002
+        assert cfg.get("dlif.train.loss") == "MSELoss"
+        # Keys the regime does not name keep the base value.
+        assert cfg.get("dlif.train.batch_size") == 8
+        assert cfg.get("dlif.cv.validation_size") == 0.15
+
+    def test_regime_reaches_train_settings(self, tmp_path):
+        from pvc_dlif.config import load_config
+        from pvc_dlif.dlif.train import TrainSettings, _build_loss
+
+        cfg = load_config(self._write_with_regimes(tmp_path, "2024"))
+        settings = TrainSettings.from_config(cfg)
+        assert (settings.epochs, settings.learning_rate) == (200, 0.0002)
+        assert type(_build_loss(settings)).__name__ == "MSELoss"
+
+    def test_regime_2026_is_the_other_protocol(self, tmp_path):
+        from pvc_dlif.config import load_config
+
+        cfg = load_config(self._write_with_regimes(tmp_path, "2026"))
+        assert (cfg.get("dlif.cv.n_folds"), cfg.get("dlif.cv.n_runs")) == (10, 10)
+        assert cfg.get("dlif.train.epochs") == 1000
+        assert cfg.get("dlif.train.loss") == "WeightedMSELoss"
+
+    def test_unknown_regime_is_rejected(self, tmp_path):
+        from pvc_dlif.config import load_config
+
+        with pytest.raises(ValueError, match="no such regime"):
+            load_config(self._write_with_regimes(tmp_path, "2027"))
 
     def test_non_deconvolution_method_is_rejected(self, tmp_path):
         from pvc_dlif.config import load_config
@@ -862,6 +1025,98 @@ class TestManifest:
         assert reloaded.meta["note"] == "x"
 
 
+class TestWindowsThatRunOffTheVolume:
+    """The group's own crop windows do not always fit inside the reconstruction.
+
+    Seven of the seventy real scans need a 96-slice axial window starting 1 to 8
+    slices too late to fit in a 128-slice volume, and their distributed inputs
+    carry exact zeros in the slices that fall outside.  Two things follow: the
+    window has to be zero-padded rather than shortened (a shorter window would
+    be resampled back up, and the input would no longer be reconstruction
+    voxels), and the offset search has to be able to reach past the wall - all
+    seven pinned at the axial maximum, which is what a search box that is too
+    small looks like from the inside.
+    """
+
+    @staticmethod
+    def _volume(shape=(60, 40, 40), seed=0):
+        rng = np.random.default_rng(seed)
+        z, y, x = np.meshgrid(*[np.arange(n) for n in shape], indexing="ij")
+        body = (((y - 20) / 9.0) ** 2 + ((x - 20) / 9.0) ** 2) < 1.0
+        taper = np.exp(-((z - 34) ** 2) / (2 * 14.0 ** 2))
+        return (body * taper + 0.05 * rng.random(shape)).astype(np.float64)
+
+    def test_a_window_past_the_end_is_zero_filled_not_shortened(self):
+        from pvc_dlif.data.grid import crop_with_zero_padding
+
+        volume = self._volume(shape=(10, 4, 4))
+        out = crop_with_zero_padding(volume, ((6, 14), (0, 4), (0, 4)))
+        assert out.shape == (8, 4, 4)
+        assert np.array_equal(out[:4], volume[6:10])
+        assert np.all(out[4:] == 0)
+
+    def test_a_window_before_the_start_is_zero_filled(self):
+        from pvc_dlif.data.grid import crop_with_zero_padding
+
+        volume = self._volume(shape=(10, 4, 4))
+        out = crop_with_zero_padding(volume, ((-3, 5), (0, 4), (0, 4)))
+        assert out.shape == (8, 4, 4)
+        assert np.all(out[:3] == 0)
+        assert np.array_equal(out[3:], volume[0:5])
+
+    def test_apply_pads_rather_than_resampling(self):
+        """A shortened window would be zoomed back up; the voxels must be exact."""
+        from pvc_dlif.data.grid import GridTransform
+
+        volume = self._volume()
+        transform = GridTransform(crop=((28, 60), (8, 32), (8, 32)), out_shape=(32, 24, 24))
+        shifted = GridTransform(crop=((34, 66), (8, 32), (8, 32)), out_shape=(32, 24, 24))
+        out = shifted.apply(volume)
+        assert out.shape == (32, 24, 24)
+        assert np.allclose(out[:26], volume[34:60, 8:32, 8:32], atol=1e-6)
+        assert np.all(out[26:] == 0)
+        del transform
+
+    def test_the_offset_search_reaches_past_the_wall(self):
+        """The optimum here is unreachable without allowing the overhang."""
+        from pvc_dlif.data.grid import crop_with_zero_padding
+        from pvc_dlif.data.preprocess import fit_offset_to_reference
+
+        volume = self._volume(seed=4)
+        crop = (32, 24, 24)
+        # 36 + 32 = 68 > 60: the true window runs eight voxels off the end.
+        truth = (36, 8, 8)
+        window = crop_with_zero_padding(
+            volume, tuple((o, o + c) for o, c in zip(truth, crop)))
+        assert np.all(window[-8:] == 0)
+
+        series = np.stack([volume * w for w in np.linspace(0.5, 1.0, 42)])
+        reference = np.stack([window * w for w in np.linspace(0.5, 1.0, 42)])
+
+        fit = fit_offset_to_reference(series, reference, scan_id="OVERHANG")
+        assert fit.offset == truth
+        assert fit.exact
+        assert fit.correlation > 0.999
+
+    def test_a_window_that_fits_is_still_found(self):
+        """The widening must not disturb the scans that were already exact."""
+        from pvc_dlif.data.grid import crop_with_zero_padding
+        from pvc_dlif.data.preprocess import fit_offset_to_reference
+
+        volume = self._volume(seed=5)
+        crop = (32, 24, 24)
+        truth = (14, 9, 7)
+        window = crop_with_zero_padding(
+            volume, tuple((o, o + c) for o, c in zip(truth, crop)))
+
+        series = np.stack([volume * w for w in np.linspace(0.5, 1.0, 42)])
+        reference = np.stack([window * w for w in np.linspace(0.5, 1.0, 42)])
+
+        fit = fit_offset_to_reference(series, reference, scan_id="INSIDE")
+        assert fit.offset == truth
+        assert fit.exact
+
+
 class TestGridCalibrationFile:
     def test_transform_is_selected_by_matrix_size(self, tmp_path):
         """Two reconstruction fields of view need two crops; using one for the
@@ -1111,3 +1366,40 @@ class TestDeviceAugmentation:
             seed=1, resume=False, folds=make_folds(ids, 2, 1), augment_on_device=True,
         )
         assert len(results) == 2 and all(r.epochs_trained == 2 for r in results)
+
+
+class TestDatasetCopies:
+    """The device path hands out a view of the cache; nothing may mutate it."""
+
+    @staticmethod
+    def _dataset(tmp_path, augment_on_device):
+        import pickle
+        from pvc_dlif.data import pkl_io
+        from pvc_dlif.dlif.dataset import DlifDataset
+
+        data = tmp_path / "data"
+        (data / "AIF_SUV").mkdir(parents=True, exist_ok=True)
+        pkl_io.save_img(data, "A1", np.arange(42 * 8 * 8 * 8, dtype=np.float64).reshape(42, 8, 8, 8),
+                        np.arange(42.0), shape=(8, 8, 8))
+        with open(data / "AIF_SUV" / "AIF_A1.pkl", "wb") as f:
+            pickle.dump({"AIF_A_int": np.ones(42), "AIF_t_int": np.arange(42.0)}, f)
+        return DlifDataset(data, ["A1"], aif_root=data, img_shape=(8, 8, 8), mode="train",
+                           augment=True, augment_on_device=augment_on_device)
+
+    def test_device_path_returns_a_view_and_leaves_the_cache_alone(self, tmp_path):
+        dataset = self._dataset(tmp_path, augment_on_device=True)
+        first = dataset[0]["INPUT"]                          # also fills the cache
+        before = np.array(dataset._cache["A1"][0], copy=True)
+        # Two reads must give the same values: no augmentation, no mutation.
+        second = dataset[0]["INPUT"]
+        np.testing.assert_array_equal(first, second)
+        np.testing.assert_array_equal(dataset._cache["A1"][0], before)
+        assert first.base is not None                      # a view, not a copy
+
+    def test_cpu_path_augments_a_copy_not_the_cache(self, tmp_path):
+        dataset = self._dataset(tmp_path, augment_on_device=False)
+        dataset[0]                                          # first access fills the cache
+        before = np.array(dataset._cache["A1"][0], copy=True)
+        dataset[0]
+        dataset[0]
+        np.testing.assert_array_equal(dataset._cache["A1"][0], before)
