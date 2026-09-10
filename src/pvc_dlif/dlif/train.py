@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -118,6 +118,10 @@ class RunResult:
     val_ids: list[str]
     test_ids: list[str]
     history: dict[str, list[float]]
+    #: The protocol this run was trained under, so a checkpoint can be traced
+    #: to it and resume can refuse one produced by a different one.  Defaults
+    #: to empty so summaries written before the stamp existed still load.
+    protocol: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -161,7 +165,9 @@ def _build_loss(settings: TrainSettings):
     name = settings.loss.lower()
     if name == "weightedmseloss":
         return WeightedMSELoss()
-    if name == "mse":
+    if name in ("mse", "mseloss"):
+        # The plain MSE of the 2024 regime.  Both spellings are accepted so a
+        # config can name it the way it names WeightedMSELoss.
         return nn.MSELoss()
     if name == "l1":
         return nn.L1Loss()
@@ -355,6 +361,7 @@ def train_one_run(
         "best_epoch": best_epoch,
         "epochs_trained": epoch + 1,
         "seconds": time.perf_counter() - started,
+        "protocol": protocol_of(settings),
         "history": history,
     }
 
@@ -378,19 +385,65 @@ def _fmt_eta(seconds: float) -> str:
     return f"{seconds / 3600:.1f} h"
 
 
-def _run_is_complete(summary_path: Path, settings: "TrainSettings") -> tuple[bool, str]:
+def protocol_of(settings: "TrainSettings") -> dict[str, Any]:
+    """The settings that define the training protocol, for the run's record.
+
+    Stamped into every summary.json so a checkpoint can be traced to the
+    protocol that produced it, and so resume can refuse one that was trained
+    under a different one.
+    """
+    return {
+        "epochs": settings.epochs,
+        "learning_rate": settings.learning_rate,
+        "loss": settings.loss,
+        "batch_size": settings.batch_size,
+        "optimizer": settings.optimizer,
+        "use_scheduler": settings.use_scheduler,
+        "early_stopping": settings.early_stopping,
+    }
+
+
+def _run_is_complete(
+    summary_path: Path,
+    settings: "TrainSettings",
+    fold: "Fold | None" = None,
+) -> tuple[bool, str]:
     """Whether an existing run may be reused under the current settings.
 
-    A pilot leaves 5-epoch checkpoints behind; the full run must not accept
-    them as finished.  A run counts as complete when it trained the configured
-    number of epochs, or stopped early under a protocol that allows it.
+    Three ways a checkpoint on disk can fail to be the run now being asked for:
+
+    * it is unfinished - a pilot leaves 5-epoch checkpoints behind, and the
+      full run must not accept them;
+    * it trained under a different protocol - switching from the 2026 regime
+      to the 2024 one takes the budget from 1000 epochs to 200, and a plain
+      ``trained >= epochs`` test would silently accept every 1000-epoch model
+      as a finished 200-epoch one.  A run can never overshoot its own budget,
+      so ``trained > epochs`` already proves a different protocol, which also
+      catches checkpoints written before the protocol was recorded;
+    * it belongs to a different partition - ``n_folds`` 10 to 17 renumbers
+      everything, so fold 1 is no longer the same scans under the same name.
     """
     try:
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False, "unreadable summary"
+
+    if fold is not None:
+        recorded = summary.get("test_ids")
+        if recorded is not None and list(recorded) != list(fold.test_ids):
+            return False, "a different fold partition (n_folds changed?)"
+
+    wanted = protocol_of(settings)
+    recorded_protocol = summary.get("protocol")
+    if recorded_protocol:
+        differing = [k for k, v in wanted.items() if recorded_protocol.get(k) != v]
+        if differing:
+            return False, "a different protocol (" + ", ".join(sorted(differing)) + ")"
+
     trained = int(summary.get("epochs_trained", 0))
-    if trained >= settings.epochs:
+    if trained > settings.epochs:
+        return False, f"a different protocol ({trained} epochs trained, {settings.epochs} configured)"
+    if trained == settings.epochs:
         return True, ""
     if settings.early_stopping and trained >= settings.min_epochs:
         return True, ""
@@ -457,7 +510,7 @@ def train_condition(
             summary_path = run_dir / "summary.json"
 
             if resume and checkpoint.exists() and summary_path.exists():
-                complete, why = _run_is_complete(summary_path, settings)
+                complete, why = _run_is_complete(summary_path, settings, fold)
                 if complete:
                     LOGGER.info("skip fold %d run %d (complete)", fold.index, run)
                     results.append(RunResult(**json.loads(summary_path.read_text(encoding="utf-8"))))
@@ -508,6 +561,7 @@ def train_condition(
                 val_ids=list(val_ids),
                 test_ids=list(fold.test_ids),
                 history=info["history"],
+                protocol=dict(info.get("protocol", {})),
             )
             summary_path.parent.mkdir(parents=True, exist_ok=True)
             summary_path.write_text(json.dumps(result.to_dict(), indent=2), encoding="utf-8")

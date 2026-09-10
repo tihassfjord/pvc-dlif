@@ -211,11 +211,16 @@ class DlifDataset:
             cached = self._read(scan_id)
             self._cache[scan_id] = cached
         image, aif, times = cached
-        image = np.array(image, copy=True)
 
         if self.augment_on_device:
+            # Nothing here mutates the array - the augmentation happens on the
+            # device and the collate makes its own copy - so hand out a view of
+            # the cached scan.  Copying it first cost 16 ms x 54 scans = 0.9 s
+            # of pure memcpy per epoch.
             return {"INPUT": image[None, ...], "AIF": aif, "ID": scan_id, "TIME": times}
 
+        # The CPU path augments in place, so it needs its own copy.
+        image = np.array(image, copy=True)
         if self.augment:
             image = self._augment(image)
 
