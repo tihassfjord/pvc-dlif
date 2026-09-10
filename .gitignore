@@ -1,8 +1,14 @@
 # --- generated output ---------------------------------------------------
 # Everything the pipeline produces goes to the `work` directory configured
 # in configs/*.yaml. Nothing generated belongs in version control.
-thesis_work/
-work/
+#
+# NOTE the leading slashes. A pattern without one matches a directory of that
+# name at ANY depth: a bare `data/` silently excluded `src/pvc_dlif/data/` -
+# grid.py, preprocess.py, dicom_io.py, pkl_io.py - so the published repository
+# could not import its own package. Anchor anything meant as a top-level
+# directory.
+/thesis_work/
+/work/
 *.nii
 *.nii.gz
 *.pkl
@@ -13,8 +19,8 @@ work/
 # --- data ---------------------------------------------------------------
 # The mouse dataset and the pretrained DLIF weights are not distributed
 # with this repository. See docs/data.md.
-data/
-dicom/
+/data/
+/dicom/
 
 # --- python -------------------------------------------------------------
 __pycache__/
