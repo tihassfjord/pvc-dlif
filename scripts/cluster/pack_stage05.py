@@ -71,6 +71,14 @@ def _copy_inputs(src_root: Path, dst_root: Path, scan_ids: list[str], shape, flo
     return copied
 
 
+def _write_lf(path: Path, text: str) -> Path:
+    """Write a file the cluster's shell will read, with Unix line endings."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(text)
+    return path
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--config", default=None, help="path to thesis.yaml")
@@ -145,8 +153,27 @@ def main() -> int:
     (out / "run").mkdir(exist_ok=True)
     for name in ("stage05_slurm.sh", "stage05_k8s.yaml", "stage05_one_fold.sh"):
         shutil.copy2(HERE / name, out / "run" / name)
-    (out / "run" / "conditions.txt").write_text("\n".join(c.name for c in conditions) + "\n", encoding="utf-8")
-    (out / "run" / "n_folds.txt").write_text(str(config.get("dlif.cv.n_folds", 10)) + "\n", encoding="utf-8")
+    # newline="\n" matters: these are read by a shell on the cluster, and by
+    # one inside the job's container.  Packed from Windows without it, Python
+    # writes CRLF, and the reader gets "10\r" as a fold count and
+    # "rl_retrained\r" as a condition name - which fails as an arithmetic
+    # error in one place and, worse, as a silently wrong condition in another.
+    _write_lf(out / "run" / "conditions.txt", "\n".join(c.name for c in conditions) + "\n")
+    _write_lf(out / "run" / "n_folds.txt", str(config.get("dlif.cv.n_folds", 10)) + "\n")
+
+    # The input pickles carry the module path of the numpy that wrote them, and
+    # that path changed between generations: numpy 2 pickles reference
+    # `numpy._core`, which numpy 1 cannot import, and the failure is a
+    # ModuleNotFoundError on the first batch rather than anything about
+    # versions.  Downcasting to float32 rewrites every pickle with the packing
+    # machine's numpy, so the cluster has to match this generation - pin it
+    # from here rather than leaving it to whatever the image happens to ship.
+    major = int(np.__version__.split(".")[0])
+    _write_lf(
+        out / "run" / "requirements.txt",
+        f"# numpy {np.__version__} wrote the input pickles in this bundle.\n"
+        f"numpy>={major}.0,<{major + 1}\n",
+    )
 
     # ---- report --------------------------------------------------------------
     size_gb = sum(p.stat().st_size for p in out.rglob("*") if p.is_file()) / 1024 ** 3

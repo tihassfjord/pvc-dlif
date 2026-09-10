@@ -1,0 +1,85 @@
+# One Kubernetes job that works through every (condition, fold) of stage 05,
+# holding at most __PARALLELISM__ GPUs at a time.
+#
+# Not submitted directly - run/submit_frink.sh --queue N fills in the
+# placeholders.
+#
+# Indexed completion mode is what makes this a queue rather than a burst:
+# Kubernetes gives each pod a distinct JOB_COMPLETION_INDEX from 0 to
+# completions-1, runs at most `parallelism` of them at once, and starts the
+# next index as soon as one finishes.  So the cluster footprint is constant and
+# small, the work drains continuously, and nothing has to be resubmitted by
+# hand.  The index maps to a condition and a fold below.
+#
+# __COMPLETIONS__   conditions x folds - the total number of pieces of work.
+# __PARALLELISM__   how many GPUs to hold at once.
+# __EXTRA__         extra flags for 05_retrain.py, e.g. "--runs 1".
+kind: Job
+apiVersion: batch/v1
+metadata:
+  name: __NAME__
+spec:
+  completionMode: Indexed
+  completions: __COMPLETIONS__
+  parallelism: __PARALLELISM__
+  # Counted across every index, not per index - and that is the trap.  Over a
+  # run of days the failures that arrive are not bugs: a pod gets scheduled
+  # onto a node whose GPUs are taken by the time kubelet admits it and is
+  # killed with `OutOfnvidia.com/gpu`, exit 137.  Three of those stopped a
+  # queue that was otherwise healthy and eight pieces in.  Set this high enough
+  # that infrastructure noise cannot end the run; a genuine bug still shows up
+  # immediately, in the first piece, where you will see it.
+  backoffLimit: 50
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: stage05
+        image: "__IMAGE__"
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: TZ
+          value: "Europe/Oslo"
+        # Without this torch starts one OpenMP thread per host core and they
+        # fight over a fraction of a CPU under the limit above.
+        - name: OMP_NUM_THREADS
+          value: "2"
+        workingDir: __BUNDLE__
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            set -euo pipefail
+            pip install -q -r run/requirements.txt -e pvc-dlif
+            folds=$(tr -d '\r' < run/n_folds.txt | tr -d '[:space:]')
+            index=${JOB_COMPLETION_INDEX:?not an indexed job}
+            condition=$(tr -d '\r' < run/conditions.txt | sed -n "$((index / folds + 1))p")
+            fold=$((index % folds + 1))
+            echo "index ${index} -> condition ${condition}, fold ${fold}"
+            bash run/stage05_one_fold.sh "${condition}" "${fold}" __EXTRA__
+        resources:
+          # The namespace quota counts `requests`, not `limits`, so a small
+          # request is what buys parallelism: at 4 CPUs requested per pod a
+          # 4500m quota fits exactly one.  The limit stays high, so a pod still
+          # uses the cores when they are free - training is dominated by kernel
+          # launches from a single Python thread, not by CPU maths.
+          requests:
+            cpu: 500m
+            memory: 4Gi
+            nvidia.com/gpu: 1
+          limits:
+            cpu: 2
+            memory: 12Gi
+            nvidia.com/gpu: 1
+        volumeMounts:
+        - name: storage
+          mountPath: /storage
+        - name: dshm
+          mountPath: /dev/shm
+      volumes:
+      - name: storage
+        persistentVolumeClaim:
+          claimName: storage
+      - name: dshm
+        emptyDir:
+          medium: Memory

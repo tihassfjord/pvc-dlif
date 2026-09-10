@@ -1,24 +1,26 @@
-# Kubernetes job for one (condition, fold) of stage 05 - the shape the group's
-# own docs/DLIF.yaml uses (one GPU per fold, jobs submitted per fold).
+# Kubernetes job for one (condition, fold) of stage 05.
 #
-# Copy the bundle to the cluster's persistent volume at /storage/pvc-dlif-bundle,
-# then for each condition and fold:
+# Not submitted directly - run/submit_frink.sh fills in the placeholders and
+# writes one file per job, because `frink run` takes a file path and deletes
+# any job with the same name before scheduling a new one.  Thirty jobs
+# therefore need thirty files and thirty distinct names.
 #
-#     sed -e 's/__COND__/rl_retrained/' -e 's/__FOLD__/3/' run/stage05_k8s.yaml | kubectl apply -f -
-#
-# or loop it:
-#
-#     for c in $(cat run/conditions.txt); do for f in $(seq 1 $(cat run/n_folds.txt)); do
-#       sed -e "s/__COND__/$c/" -e "s/__FOLD__/$f/" run/stage05_k8s.yaml | kubectl apply -f -
-#     done; done
+# __NAME__   RFC 1123 job name: lowercase, digits and '-' only.  Condition
+#            names contain underscores, which Kubernetes rejects, so the
+#            submit script translates them.
+# __COND__   the condition as stage 05 knows it, underscores intact.
+# __FOLD__   1-based fold index.
+# __EXTRA__  extra flags forwarded to 05_retrain.py, e.g. "--runs 1".
 #
 # The image needs python >= 3.10 with torch (CUDA), numpy, scipy, pandas,
-# pyyaml, scikit-learn, nibabel, pydicom; `pip install -e /storage/pvc-dlif-bundle/pvc-dlif`
-# is run at start so the image does not have to contain this package.
+# pyyaml, scikit-learn, nibabel and pydicom.  `pip install -e pvc-dlif` runs at
+# start so the image does not have to contain this package - that needs network
+# access from the pod.  If the pod has none, build an image with the
+# dependencies baked in and drop the pip line.
 kind: Job
 apiVersion: batch/v1
 metadata:
-  name: pvc-dlif-05-__COND__-f__FOLD__
+  name: __NAME__
 spec:
   backoffLimit: 0
   template:
@@ -26,22 +28,35 @@ spec:
       restartPolicy: OnFailure
       containers:
       - name: stage05
-        image: "pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime"   # or the group's image, e.g. llu025/dlif:springfield
+        image: "__IMAGE__"
         env:
-        - name: TZ
-          value: "Europe/Oslo"
         - name: PYTHONUNBUFFERED
           value: "1"
-        workingDir: /storage/pvc-dlif-bundle
+        - name: TZ
+          value: "Europe/Oslo"
+        # Without this torch starts one OpenMP thread per host core and they
+        # fight over a fraction of a CPU under the limit above.
+        - name: OMP_NUM_THREADS
+          value: "2"
+        workingDir: __BUNDLE__
         command: ["/bin/sh", "-c"]
         args:
         - >
-          pip install -q -e pvc-dlif &&
-          bash run/stage05_one_fold.sh __COND__ __FOLD__
+          pip install -q -r run/requirements.txt -e pvc-dlif &&
+          bash run/stage05_one_fold.sh __COND__ __FOLD__ __EXTRA__
         resources:
+          # The namespace quota counts `requests`, not `limits`, so a small
+          # request is what buys parallelism: at 4 CPUs requested per pod a
+          # 4500m quota fits exactly one.  The limit stays high, so a pod still
+          # uses the cores when they are free - training is dominated by kernel
+          # launches from a single Python thread, not by CPU maths.
+          requests:
+            cpu: 500m
+            memory: 4Gi
+            nvidia.com/gpu: 1
           limits:
-            cpu: 4
-            memory: 16Gi
+            cpu: 2
+            memory: 12Gi
             nvidia.com/gpu: 1
         volumeMounts:
         - name: storage
