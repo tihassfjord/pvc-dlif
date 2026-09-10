@@ -30,9 +30,7 @@ from _common import base_parser, start
 
 from pvc_dlif.data import pkl_io
 from pvc_dlif.data.manifest import load_manifest
-from pvc_dlif.dlif.adapter import DlifRepo, build_model
 from pvc_dlif.dlif.dataset import load_folds, make_folds
-from pvc_dlif.dlif.infer import predict_retrained, predictions_to_frame, save_predictions
 from pvc_dlif.eval.bias_variance import decompose_by_condition, decompose_frame
 from pvc_dlif.eval.curve_metrics import metrics_frame
 from pvc_dlif.eval.frames import failure_modes, frame_error_table, summarise_by_bin
@@ -91,6 +89,16 @@ def main() -> int:
         LOGGER.warning("No pretrained predictions; run stage 04")
 
     if not args.skip_retrained:
+        # Imported here, not at module scope: --skip-retrained scores the
+        # pretrained predictions alone and must not need torch for it.  On one
+        # Windows/conda environment importing torch alongside numpy aborted the
+        # process inside numpy's BLAS, which took down a run that never
+        # intended to touch a GPU.
+        from pvc_dlif.dlif.adapter import DlifRepo, build_model
+        from pvc_dlif.dlif.infer import (
+            predict_retrained, predictions_to_frame, save_predictions,
+        )
+
         retrained_path = config.dir_predictions / "retrained.parquet"
         retrained = _read_table(retrained_path) if args.reuse_predictions else None
         if retrained is None:
