@@ -158,9 +158,18 @@ def main() -> int:
     (out / "configs" / "cluster.yaml").write_text(text, encoding="utf-8")
 
     # ---- job templates -------------------------------------------------------
+    # Every shell script and job manifest beside this packer, rather than a
+    # list of names.  The list version silently fell behind twice: the queue
+    # template and the submission script were added to the repository after a
+    # bundle had been packed, so the bundle lacked exactly the two files needed
+    # to submit anything, and the omission only surfaced as "No such file or
+    # directory" at the point of use.  A glob cannot fall behind.
     (out / "run").mkdir(exist_ok=True)
-    for name in ("stage05_slurm.sh", "stage05_k8s.yaml", "stage05_one_fold.sh"):
-        shutil.copy2(HERE / name, out / "run" / name)
+    templates = sorted(
+        path for pattern in ("*.sh", "*.yaml") for path in HERE.glob(pattern)
+    )
+    for source in templates:
+        shutil.copy2(source, out / "run" / source.name)
     # newline="\n" matters: these are read by a shell on the cluster, and by
     # one inside the job's container.  Packed from Windows without it, Python
     # writes CRLF, and the reader gets "10\r" as a fold count and
@@ -195,6 +204,9 @@ def main() -> int:
         "runs_per_fold": int(config.get("dlif.cv.n_runs", 10)),
         "epochs": int(config.get("dlif.train.epochs", 1000)),
         "dlif_repo_commit": repo.commit(),
+        # Named so a bundle can be checked for the file it will be submitted
+        # with, before it is copied to the cluster rather than after.
+        "run_files": [t.name for t in templates],
         "float32": not args.keep_float64,
         "size_gb": round(size_gb, 2),
         "jobs": len(conditions) * int(config.get("dlif.cv.n_folds", 10)),
