@@ -1403,3 +1403,74 @@ class TestDatasetCopies:
         dataset[0]
         dataset[0]
         np.testing.assert_array_equal(dataset._cache["A1"][0], before)
+
+
+class TestArmFamilies:
+    """The correction family a condition joins must not depend on unrelated work.
+
+    Holm corrects within an arm.  If a motion condition joined the arm that
+    carries the main hypothesis, adding one would move that hypothesis'
+    adjusted p-value without anything about the PVC experiment having changed.
+    That happened once already, when PSF conditions moved it from 0.26 to 0.36,
+    and the arms exist to stop it.  Registration and deconvolution are
+    different interventions and are corrected separately.
+    """
+
+    @staticmethod
+    def _condition(name, method, motion, source=None):
+        from dataclasses import dataclass
+
+        @dataclass
+        class _C:
+            name: str
+            pvc_method: object
+            motion: bool
+            model: str
+            checkpoints_from: object = None
+
+            @property
+            def borrows_checkpoints(self):
+                return self.checkpoints_from is not None
+
+        return _C(name, method, motion, "retrained", source)
+
+    def _base(self):
+        return [
+            self._condition("baseline_retrained", None, False),
+            self._condition("rl_retrained", "RL", False),
+            self._condition("rvc_retrained", "RVC", False),
+        ]
+
+    def test_motion_conditions_form_their_own_family(self):
+        from pvc_dlif.report import assemble
+
+        conditions = self._base() + [
+            self._condition("mc_baseline_retrained", None, True),
+            self._condition("mc_rl_retrained", "RL", True),
+        ]
+        arms = {a["name"]: a for a in assemble.condition_arms(conditions, "baseline_retrained")}
+
+        assert sorted(arms["retrained"]["conditions"]) == ["rl_retrained", "rvc_retrained"]
+        assert sorted(arms["motion"]["conditions"]) == [
+            "mc_baseline_retrained", "mc_rl_retrained",
+        ]
+        # Both read against the unregistered, uncorrected baseline.
+        assert arms["motion"]["reference"] == "baseline_retrained"
+
+    def test_adding_motion_does_not_change_the_main_family(self):
+        from pvc_dlif.report import assemble
+
+        without = assemble.condition_arms(self._base(), "baseline_retrained")
+        with_motion = assemble.condition_arms(
+            self._base() + [self._condition("mc_rl_retrained", "RL", True)],
+            "baseline_retrained",
+        )
+        main_before = next(a for a in without if a["name"] == "retrained")
+        main_after = next(a for a in with_motion if a["name"] == "retrained")
+        assert main_before["conditions"] == main_after["conditions"]
+
+    def test_no_motion_arm_when_there_are_no_motion_conditions(self):
+        from pvc_dlif.report import assemble
+
+        arms = assemble.condition_arms(self._base(), "baseline_retrained")
+        assert not any(a["name"] == "motion" for a in arms)

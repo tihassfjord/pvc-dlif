@@ -90,7 +90,16 @@ def condition_arms(conditions: list, reference: str,
         currently in use behave on corrected images?
     ``retrained``
         Models fitted on their own input representation, against the retrained
-        baseline.  Answers the main hypothesis.
+        baseline.  Answers the main hypothesis, and is the primary endpoint.
+    ``motion``
+        Models fitted on a motion-corrected representation, against the same
+        retrained baseline.  Registration is a different intervention from
+        deconvolution, so it is a separate question and a separate correction
+        family.  Were it folded into ``retrained``, adding a motion condition
+        would move the main hypothesis' adjusted p-value without anything about
+        the PVC experiment having changed -- which is the failure the arms
+        exist to prevent, seen once already when PSF conditions moved it from
+        0.26 to 0.36.
     ``fixed_weights`` (one group per set of borrowed weights)
         One set of retrained weights applied to several inputs, against the
         condition those weights were fitted by.  Answers: how much does the
@@ -120,14 +129,28 @@ def condition_arms(conditions: list, reference: str,
 
     deployed = [c for c in conditions if c.model != "retrained"]
     borrowed = [c for c in conditions if c.model == "retrained" and c.borrows_checkpoints]
-    retrained = [c for c in conditions
-                 if c.model == "retrained" and not c.borrows_checkpoints]
+    fitted = [c for c in conditions
+              if c.model == "retrained" and not c.borrows_checkpoints]
+    # Registration and deconvolution are different interventions, so the
+    # conditions trained on a registered representation form their own family.
+    # Both read against the same unregistered, uncorrected baseline: the
+    # question each answers is "does this preprocessing step help", and they
+    # answer it about different steps.
+    retrained = [c for c in fitted if not c.motion]
+    motion = [c for c in fitted if c.motion]
 
+    main_reference = reference if reference in by_name else pick_reference(retrained)
     groups = [
         ("deployed", deployed, pick_reference(deployed),
          f"{deployed_label} on each input representation"),
-        ("retrained", retrained, reference if reference in by_name else pick_reference(retrained),
+        ("retrained", retrained, main_reference,
          f"{retrained_label}, each fitted on its own input"),
+        # The reference is the unregistered baseline, which is not a member of
+        # this group; ``condition_arms`` drops it from the target list below,
+        # so the family is the motion conditions alone.
+        ("motion", [*motion, *( [by_name[main_reference]] if main_reference in by_name else [] )],
+         main_reference,
+         f"{retrained_label}, fitted on motion-corrected input"),
     ]
 
     # A borrowed condition is read against the condition it borrowed from, not
