@@ -116,9 +116,18 @@ def main() -> int:
         and not c.borrows_checkpoints
     ]
     if skipped:
+        # Worded carefully: these are conditions in the config that this run
+        # was not asked for, not conditions it was asked for and declined.
+        # The earlier phrasing read as the latter, which is alarming in a
+        # cluster log where each job trains exactly one (condition, fold) and
+        # the message therefore names whichever motion condition is not this
+        # job's.  ``skipped`` is by construction the complement of what is
+        # being trained, so a condition appearing here is one that was never
+        # selected.
         LOGGER.info(
-            "skipping motion conditions (%s) - they are stage 07's subset; "
-            "use --include-motion to train them here",
+            "also in the config, not selected for this run: %s. Motion "
+            "conditions are trained only when named explicitly or when "
+            "--include-motion is given",
             ", ".join(skipped),
         )
 
