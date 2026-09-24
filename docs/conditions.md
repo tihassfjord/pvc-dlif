@@ -76,7 +76,32 @@ on its own representation, 10 folds × 10 runs.
 | `rvc_retrained` | RVC, k = 15 | RVC, k = 15 |
 
 Training and inference match in all three. This is the comparison the thesis
-turns on.
+turns on, and it is the primary endpoint: its Holm family is these two
+comparisons and nothing else.
+
+## Arm 2b — `motion`: a separate family
+
+Reference: `baseline_retrained`, the same unregistered baseline. Registration is
+a different intervention from deconvolution, so these are corrected among
+themselves. Folded into the arm above, adding one of them would move the main
+hypothesis' adjusted p-value without anything about the PVC experiment having
+changed.
+
+| Condition | Trained on | Ordering |
+|---|---|---|
+| `mc_baseline_retrained` | registered, uncorrected | — |
+| `mc_rl_retrained` | registered then RL | MC first |
+| `mc_pvcfirst_rl_retrained` | RL then registered | PVC first |
+
+The last two are the same pipeline with the corrections swapped. The borrowed
+pair below ranks the orderings under a model trained on uncorrected images,
+where both double-correct; these two rank them for a model trained on what it
+is shown, which is the question that bears on how a pipeline should be built.
+
+The name follows the input tree each reads (`mc_rl_i15`,
+`mc_pvcfirst_rl_i15`), so `mc_pvcfirst_rl_retrained` is not the same thing as
+the borrowed `mc_rl_pvcfirst_retrained`. That is an unfortunate near-collision;
+check `checkpoints_from` if in doubt — a borrowed condition has one.
 
 ## Arm 3 — `fixed_weights`: the forward shift
 
@@ -114,15 +139,11 @@ under-corrects, which is the prediction these two conditions confirmed.
 
 ## Defined but never run
 
-| Condition | Why |
-|---|---|
-| `mc_baseline_retrained` | would need its own 10 × 10 training |
-| `mc_rl_retrained` | same |
-
-Both sit in the config so the design is complete on paper, but they were not
-trained. `mc_baseline_shift_retrained` settles the question at inference cost:
-registration on its own changes nothing measurable (p = 0.445). Spending 200 GPU
-jobs to establish a null more precisely was judged not worth it.
+None. `mc_baseline_retrained`, `mc_rl_retrained` and
+`mc_pvcfirst_rl_retrained` were trained on 2026-09-24, after it was noticed
+that inferring the matched case from a borrowed one is the inference this
+study elsewhere shows to be wrong: for deconvolution, the mismatched cells of
+the 2×2 are far worse than either matched cell.
 
 ---
 
@@ -131,7 +152,10 @@ jobs to establish a null more precisely was judged not worth it.
 Read the suffixes:
 
 * ends in `_pretrained` → arm 1, reference `baseline_pretrained`
-* ends in `_retrained` with no `shift` → arm 2, reference `baseline_retrained`
+* ends in `_retrained` with no `shift` and no `mc_` → arm 2, the primary
+  family, reference `baseline_retrained`
+* starts with `mc_` and has no `checkpoints_from` → the `motion` family, same
+  reference, corrected separately
 * contains `_shift` but not `_reverse` → arm 3, reference `baseline_retrained`
 * contains `_reverse_shift` → its own arm, reference is the condition named in
   the prefix
