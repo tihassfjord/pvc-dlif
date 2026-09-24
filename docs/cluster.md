@@ -71,6 +71,19 @@ Edit the image and the volume claim in `run/stage05_k8s.yaml` to match the
 cluster. Both templates call `run/stage05_one_fold.sh`, so extra flags
 (`--runs 3`, `--epochs 300`) go in one place.
 
+**Pinning to one machine.** The nodes differ by more than a label: 2.1 s/epoch
+on flanders against roughly 10 s on a 2080 Ti, and worse again on the 1080 Ti
+nodes where mixed precision buys nothing. One node has also produced NVML
+driver/library version mismatches. `--node flanders` writes
+`nodeSelector: kubernetes.io/hostname: flanders`; `--gpu-type` selects by the
+cluster's GPU label instead. Pinning costs queueing time and buys predictable
+throughput, which is the better trade when the grid is small.
+
+```bash
+BUNDLE_REMOTE=/storage/stage05_bundle_mc \
+  bash run/submit_frink.sh --queue 2 --node flanders --runs 3
+```
+
 Jobs are resumable: a killed job resubmitted with the same arguments skips the
 runs that completed their epochs and redoes the rest.
 
