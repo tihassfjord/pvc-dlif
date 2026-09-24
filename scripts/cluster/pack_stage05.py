@@ -87,6 +87,9 @@ def main() -> int:
                         help="copy the input pickles byte-for-byte instead of downcasting")
     parser.add_argument("--conditions", nargs="*", default=None,
                         help="retrained conditions to include (default: all)")
+    parser.add_argument("--include-motion", action="store_true",
+                        help="also pack conditions marked motion: true (stage 07's "
+                             "trees). Off by default, matching stage 05.")
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -96,8 +99,13 @@ def main() -> int:
     manifest = load_manifest(config.work / "manifest.json")
     scan_ids = manifest.usable_ids
     shape = config.retrain_shape
-    conditions = [c for c in config.conditions if c.model == "retrained" and not c.motion
-                  and (args.conditions is None or c.name in set(args.conditions))]
+    # The same selection stage 05 makes, from the same helper rather than a
+    # second copy of the rule.  A bundle that packs a different set from the
+    # one the cluster then trains is a failure that only shows up hours later,
+    # as a missing input tree on a node.
+    conditions = config.retrained_conditions(
+        include_motion=args.include_motion, names=args.conditions,
+    )
     tags = sorted({c.input_tag for c in conditions})
 
     # ---- this package ------------------------------------------------------
