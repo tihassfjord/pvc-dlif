@@ -45,3 +45,11 @@ Thumbs.db
 # paths to someone's dataset and does not belong in version control.
 configs/thesis.yaml
 configs/synthetic.yaml
+
+# --- stray artefacts ------------------------------------------------------
+# A Windows path used as a relative path creates a literal `E:/` directory
+# here; it holds nothing but a copy of a log the pipeline already wrote to
+# the work directory.
+/E:/
+falconz-*.log
+*.log

@@ -73,7 +73,10 @@ def main() -> int:
 
     # What is still missing, per condition, so the next submission is exact
     missing: dict[str, list[str]] = {}
-    for condition in (c for c in config.conditions if c.model == "retrained" and not c.motion):
+    # Borrowed-checkpoint conditions train nothing, so every run would count as
+    # missing and the report would never reach zero.  They are stage 06's work.
+    for condition in (c for c in config.conditions
+                      if c.model == "retrained" and not c.motion and not c.borrows_checkpoints):
         for fold in range(1, n_folds + 1):
             for run in range(1, n_runs + 1):
                 if _epochs_trained(target / condition.name / f"fold_{fold:02d}" / f"run_{run:02d}") < epochs:

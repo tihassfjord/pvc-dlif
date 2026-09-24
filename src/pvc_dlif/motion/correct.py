@@ -20,6 +20,7 @@ translation only, and it says so in its output.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -36,6 +37,7 @@ LOGGER = get_logger(__name__)
 __all__ = [
     "MotionCorrectionResult", "FalconRunner", "rigid_translation_correct",
     "reference_frame_index", "interpolation_smoothing_cost",
+    "read_falcon_transforms", "transforms_from_result", "summarise_transforms",
 ]
 
 
@@ -190,15 +192,35 @@ class FalconRunner:
         output_dir: Path,
         reference_frame: int = -1,
         registration: str = "rigid",
-        multi_resolution: str = "2x1",
+        multi_resolution: str | None = None,
+        start_frame: int | None = None,
+        mode: str | None = None,
+        keep_intermediates: bool = False,
         extra_args: Sequence[str] = (),
     ) -> Path:
         """Run FALCON on a 4D NIfTI and return the corrected 4D file.
 
-        The FALCON command line has changed between releases, so the invocation
-        is kept in one place and the raw stdout/stderr is written next to the
-        output.  If FALCON's flags differ in the installed version, adjust here
-        rather than scattering variants through the pipeline.
+        The flags below match falconz as installed:
+
+            -d   directory holding the images to correct
+            -rf  reference frame index (0-based)
+            -sf  frame to start correcting from
+            -r   rigid | affine | deformable
+            -i   iterations per resolution level
+            -m   cruise | dash
+            -o   output 4D NIfTI
+
+        Two things this gets right that are easy to get wrong.  ``-d`` takes a
+        *directory*, and pointing it at the folder the input happens to live in
+        would hand FALCON every other scan in that folder as well -- so the one
+        series is copied into a private directory first.  And the output path
+        is given explicitly with ``-o`` rather than recovered by globbing for
+        ``*moco*``, which silently picks the wrong file as soon as a directory
+        is reused.
+
+        Optional arguments are omitted when not set, so falconz applies its own
+        defaults instead of ours.  The full command and the raw stdout/stderr
+        are written beside the output, so what actually ran is recoverable.
         """
         if not self.available:
             raise RuntimeError(
@@ -206,20 +228,56 @@ class FalconRunner:
                 "or use the rigid-translation fallback for a preliminary look."
             )
 
+        input_nifti = Path(input_nifti)
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        cmd = [
-            str(self.executable),
-            "-d", str(Path(input_nifti).parent),
-            "-r", registration,
-            "-i", str(reference_frame),
-            "-sf", multi_resolution,
-            *extra_args,
-        ]
-        LOGGER.info("Running FALCON: %s", " ".join(cmd))
-        result = subprocess.run(cmd, cwd=str(output_dir), capture_output=True, text=True, check=False)
+        # One scan per input directory: FALCON corrects everything it finds, so
+        # pointing it at work/native would hand it all seventy.  A hard link
+        # gives it a directory with exactly one series in it without a second
+        # copy of the data on disk; copy only when linking is refused (a
+        # different volume, or a filesystem without links).
+        stage = output_dir / "input"
+        if stage.exists():
+            shutil.rmtree(stage)
+        stage.mkdir(parents=True)
+        staged_input = stage / input_nifti.name
+        try:
+            os.link(input_nifti, staged_input)
+        except OSError:
+            shutil.copy2(input_nifti, staged_input)
 
+        corrected = output_dir / f"{input_nifti.name.split('.')[0]}_moco.nii.gz"
+
+        cmd = [str(self.executable), "-d", str(stage), "-r", registration]
+        if reference_frame is not None and reference_frame >= 0:
+            cmd += ["-rf", str(int(reference_frame))]
+        if start_frame is not None:
+            cmd += ["-sf", str(int(start_frame))]
+        if multi_resolution:
+            cmd += ["-i", str(multi_resolution)]
+        if mode:
+            cmd += ["-m", str(mode)]
+        cmd += ["-o", str(corrected), *extra_args]
+
+        # falconz prints emoji in its progress output.  With stdout captured
+        # rather than attached to a terminal, Python picks the child's encoding
+        # from the locale -- cp1252 on a Norwegian Windows install -- and the
+        # run dies with UnicodeEncodeError on the first decorated line, before
+        # it has looked at a single voxel.  Forcing UTF-8 on the child is the
+        # whole fix; errors="replace" keeps a stray byte from doing it again.
+        env = {
+            **os.environ,
+            "PYTHONIOENCODING": "utf-8",
+            "PYTHONUTF8": "1",
+        }
+        LOGGER.info("Running FALCON: %s", " ".join(cmd))
+        result = subprocess.run(
+            cmd, cwd=str(output_dir), capture_output=True, check=False,
+            text=True, encoding="utf-8", errors="replace", env=env,
+        )
+
+        (output_dir / "falcon_command.txt").write_text(" ".join(cmd) + "\n", encoding="utf-8")
         (output_dir / "falcon_stdout.txt").write_text(result.stdout or "", encoding="utf-8")
         (output_dir / "falcon_stderr.txt").write_text(result.stderr or "", encoding="utf-8")
 
@@ -228,10 +286,171 @@ class FalconRunner:
                 f"FALCON failed (exit {result.returncode}). See {output_dir}/falcon_stderr.txt"
             )
 
-        candidates = sorted(output_dir.rglob("*moco*.nii*")) or sorted(output_dir.rglob("*.nii.gz"))
+        if corrected.exists():
+            self._tidy(output_dir, stage, keep_intermediates)
+            return corrected
+        # Older builds ignore -o and write where they like; fall back to a
+        # search, but never into the staged input we just put there.
+        candidates = [
+            p for p in sorted(output_dir.rglob("*moco*.nii*")) + sorted(output_dir.rglob("*.nii.gz"))
+            if stage not in p.parents
+        ]
         if not candidates:
-            raise RuntimeError(f"FALCON produced no NIfTI output under {output_dir}")
+            raise RuntimeError(
+                f"FALCON exited cleanly but produced no NIfTI under {output_dir}. "
+                f"See falcon_stdout.txt."
+            )
         return candidates[0]
+
+    @staticmethod
+    def _tidy(output_dir: Path, stage: Path, keep_intermediates: bool) -> None:
+        """Keep the transforms, drop FALCON's scratch.
+
+        A run leaves roughly 290 MB behind, of which about 250 MB is working
+        data: every frame written out singly before correction, again after,
+        the per-frame cross-correlation volumes, and a second copy of the
+        merged result.  Over seventy scans and two orderings that is some 35 GB
+        of files nothing reads again.
+
+        The transforms are the exception and are moved up beside the output:
+        they are a few hundred bytes each and they are the record of how far
+        the animal actually moved, which is the number worth reporting.
+        """
+        run_dirs = sorted(output_dir.glob("FALCONZ-*"))
+        for run_dir in run_dirs:
+            transforms = run_dir / "transforms"
+            if transforms.is_dir():
+                target = output_dir / "transforms"
+                if target.exists():
+                    shutil.rmtree(target)
+                shutil.move(str(transforms), str(target))
+            if not keep_intermediates:
+                shutil.rmtree(run_dir, ignore_errors=True)
+        if not keep_intermediates and stage.exists():
+            # Hard-linked, so this frees a directory entry and not the data.
+            shutil.rmtree(stage, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
+# Reading back what the correction actually did.
+#
+# This is the measurement worth reporting.  It is not an estimate made after
+# the fact from the images: it is the transformation the registration chose and
+# applied, in millimetres, per frame.  A homemade displacement measure has to
+# separate the animal moving from the tracer redistributing and is easily
+# fooled by the second; the registration's own parameters have no such problem,
+# because a shift is all they can express.
+# --------------------------------------------------------------------------- #
+
+
+def _decompose(matrix: np.ndarray) -> tuple[np.ndarray, float]:
+    """Translation in mm and rotation magnitude in degrees from a 4x4 rigid matrix."""
+    translation = np.asarray(matrix[:3, 3], dtype=float)
+    rotation = np.asarray(matrix[:3, :3], dtype=float)
+    cosine = (float(np.trace(rotation)) - 1.0) / 2.0
+    angle = float(np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0))))
+    return translation, angle
+
+
+def read_falcon_transforms(transform_dir: Path) -> list[dict[str, Any]]:
+    """Per-frame rigid transforms FALCON wrote, as millimetres and degrees.
+
+    One ``vol_XXXX.nii.gz_rigid.mat`` per corrected frame; the reference frame
+    has none, and is reported as an exact zero rather than being left out.
+    """
+    import re
+
+    transform_dir = Path(transform_dir)
+    rows: list[dict[str, Any]] = []
+    for path in sorted(transform_dir.glob("*_rigid.mat")):
+        match = re.search(r"vol_(\d+)", path.name)
+        if not match:
+            continue
+        try:
+            matrix = np.loadtxt(path)
+        except (OSError, ValueError):
+            LOGGER.warning("could not read transform %s", path)
+            continue
+        if matrix.shape != (4, 4):
+            LOGGER.warning("transform %s is %s, expected 4x4", path, matrix.shape)
+            continue
+        translation, angle = _decompose(matrix)
+        rows.append({
+            "frame": int(match.group(1)),
+            "tx_mm": float(translation[0]),
+            "ty_mm": float(translation[1]),
+            "tz_mm": float(translation[2]),
+            "translation_mm": float(np.linalg.norm(translation)),
+            "rotation_deg": angle,
+        })
+    rows.sort(key=lambda r: r["frame"])
+    return rows
+
+
+def transforms_from_result(result: MotionCorrectionResult) -> list[dict[str, Any]]:
+    """The same per-frame table for the translation-only fallback.
+
+    Given so the QC columns mean the same thing whichever method produced the
+    correction.  Rotation is always zero here, which is exactly the fallback's
+    limitation made visible rather than hidden.
+    """
+    rows: list[dict[str, Any]] = []
+    for frame, (shift, magnitude) in enumerate(
+        zip(result.shifts_mm, result.residual_displacement_mm)
+    ):
+        rows.append({
+            "frame": frame,
+            "tx_mm": float(shift[0]), "ty_mm": float(shift[1]), "tz_mm": float(shift[2]),
+            "translation_mm": float(magnitude),
+            "rotation_deg": 0.0,
+        })
+    return rows
+
+
+def summarise_transforms(
+    rows: Sequence[dict[str, Any]],
+    rotation_suspect_deg: float = 2.0,
+) -> dict[str, Any]:
+    """Summarise a per-frame transform table, separating trustworthy frames.
+
+    Before the bolus arrives there is almost no anatomy in a frame, and an
+    intensity-based registration will still return *an* answer for it -- one
+    fitted to noise.  Those failures are recognisable: a mouse in a holder does
+    not rotate several degrees between neighbouring frames and then come back,
+    so the rotation magnitude separates them from real motion far more cleanly
+    than the translation does.  Frames above the threshold are counted and
+    reported, and kept out of the summary statistics rather than inflating them.
+    """
+    if not rows:
+        return {
+            "n_frames": 0, "n_suspect": 0, "first_reliable_frame": None,
+            "translation_median_mm": float("nan"), "translation_p95_mm": float("nan"),
+            "translation_max_mm": float("nan"), "rotation_max_deg": float("nan"),
+            "suspect_frames": "",
+        }
+
+    translation = np.array([r["translation_mm"] for r in rows], dtype=float)
+    rotation = np.array([r["rotation_deg"] for r in rows], dtype=float)
+    frames = np.array([r["frame"] for r in rows], dtype=int)
+    suspect = rotation > rotation_suspect_deg
+
+    trusted = translation[~suspect]
+    trusted_rotation = rotation[~suspect]
+    # Where the registration starts behaving: the first frame after the last
+    # suspect one.  That is the value to give falconz as --start_frame.
+    first_reliable = int(frames[suspect].max()) + 1 if suspect.any() else int(frames.min())
+
+    return {
+        "n_frames": int(len(rows)),
+        "n_suspect": int(suspect.sum()),
+        "suspect_frames": " ".join(str(f) for f in frames[suspect]),
+        "first_reliable_frame": first_reliable,
+        "translation_median_mm": float(np.median(trusted)) if trusted.size else float("nan"),
+        "translation_p95_mm": float(np.percentile(trusted, 95)) if trusted.size else float("nan"),
+        "translation_max_mm": float(trusted.max()) if trusted.size else float("nan"),
+        "rotation_max_deg": float(trusted_rotation.max()) if trusted_rotation.size else float("nan"),
+        "translation_max_including_suspect_mm": float(translation.max()),
+    }
 
 
 def interpolation_smoothing_cost(

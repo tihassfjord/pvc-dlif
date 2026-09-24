@@ -83,12 +83,37 @@ def main() -> int:
     conditions = config.retrained_conditions(
         include_motion=args.include_motion, names=args.conditions,
     )
+
+    # Conditions that borrow another condition's checkpoints have nothing to
+    # train: they exist to run an already-trained model against a different
+    # input representation, which stage 06 does at inference time.  Say so
+    # explicitly - a silent skip here would look like a missing condition.
+    borrowed = [
+        c for c in config.conditions
+        if c.borrows_checkpoints
+        and (args.conditions is None or c.name in set(args.conditions))
+    ]
+    if borrowed:
+        LOGGER.info(
+            "not training %s - %s reuse checkpoints from %s and are produced by "
+            "stage 06 at inference time",
+            ", ".join(c.name for c in borrowed),
+            "they" if len(borrowed) > 1 else "it",
+            ", ".join(sorted({c.checkpoints_from for c in borrowed})),
+        )
+
     if not conditions:
+        if borrowed:
+            raise SystemExit(
+                "Only borrowed-checkpoint conditions were selected; there is nothing to "
+                "train. Run stage 06 instead."
+            )
         raise SystemExit("No retrained conditions selected")
     chosen = {c.name for c in conditions}
     skipped = [
         c.name for c in config.conditions
         if c.model == "retrained" and c.motion and c.name not in chosen
+        and not c.borrows_checkpoints
     ]
     if skipped:
         LOGGER.info(
@@ -205,6 +230,10 @@ def main() -> int:
             seed=config.seed,
             resume=not args.no_resume,
             folds=folds,
+            # Train the selected folds, but record the whole partition: with
+            # one fold per cluster job, every job writes this file, and only a
+            # complete record survives the last writer.
+            partition=all_folds,
         )
         summary[condition.name] = {
             "runs": len(results),

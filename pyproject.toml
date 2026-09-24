@@ -40,7 +40,7 @@ dev = ["pytest>=7.4", "pytest-cov>=4.1"]
 all = ["torch>=2.0", "pyarrow>=14.0", "scikit-image>=0.22", "pytest>=7.4"]
 
 [project.urls]
-Repository = "https://github.com/<your-username>/pvc-dlif"
+Repository = "https://github.com/tihassfjord/pvc-dlif"
 
 [project.scripts]
 # `pvc-dlif-gui` from any terminal once the package is installed.

@@ -265,12 +265,16 @@ class _PlotPane(ttk.Frame):
     """Picker + figure host. Every figure comes from pvc_dlif.report.figures."""
 
     PLOTS = [
+        ("Effects forest", "Every comparison on one shared axis, with confidence intervals. "
+                           "The whole study in one figure."),
         ("Paired metric", "One line per scan from the reference to each condition - what the "
                           "Wilcoxon test actually sees."),
         ("Bias / variance", "MSE split into bias^2 and variance per condition (stacked)."),
         ("Error by time bin", "Where along the curve each condition wins or loses."),
         ("Iteration sweep", "Median metric against deconvolution iteration count, per method. "
                             "A sensitivity analysis, not a search."),
+        ("PSF sweep", "Median metric against the PSF width the correction assumed. How much "
+                      "the result depends on the measured PSF being right."),
         ("Recovery vs noise", "Per-frame peak recovery against noise amplification, coloured by "
                               "count level, for one PVC tag."),
         ("Curve overlay", "Every condition's predicted input function against the arterial curve "
@@ -295,6 +299,16 @@ class _PlotPane(ttk.Frame):
         self.metric_box = ttk.Combobox(controls, textvariable=self.metric, width=14, state="readonly",
                                        values=("rmse",))
         self.metric_box.pack(side="left")
+
+        ttk.Label(controls, text="Arm").pack(side="left", padx=(12, 4))
+        self.arm = tk.StringVar()
+        self.arm_box = ttk.Combobox(controls, textvariable=self.arm, width=14, state="readonly")
+        self.arm_box.pack(side="left")
+        ToolTip(self.arm_box,
+                "The deployed model and the retrained model are different networks. Drawing "
+                "their conditions on one axis against one reference shows that architectural "
+                "difference as though it were an effect of the correction, so each arm is "
+                "drawn separately against its own reference.")
 
         ttk.Label(controls, text="Tag").pack(side="left", padx=(12, 4))
         self.tag = tk.StringVar()
@@ -323,7 +337,32 @@ class _PlotPane(ttk.Frame):
             if name == self.plot_name.get():
                 self.hint.configure(text=text)
 
+    def _arms(self) -> list[dict]:
+        """The arm split, or an empty list when the config is not loaded."""
+        from pvc_dlif.report import assemble
+
+        config = self.tab.config()
+        if config is None:
+            return []
+        reference = self.tab.summary.get("reference") or config.reference_condition.name
+        try:
+            return assemble.condition_arms(config.conditions, reference,
+                                           config.get("dlif.model_labels"))
+        except Exception:                                   # noqa: BLE001 - older config
+            return []
+
+    def _arm(self) -> dict | None:
+        for arm in self._arms():
+            if arm["name"] == self.arm.get():
+                return arm
+        return None
+
     def on_data_loaded(self) -> None:
+        arms = [a["name"] for a in self._arms()]
+        self.arm_box.configure(values=arms or ["(all)"])
+        if self.arm.get() not in arms:
+            self.arm.set(arms[0] if arms else "(all)")
+
         metrics = self.tab.tables.get("curve_metrics")
         if metrics is not None:
             numeric = [c for c in metrics.columns                                  # type: ignore[attr-defined]
@@ -361,28 +400,59 @@ class _PlotPane(ttk.Frame):
         metrics = self.tab.tables.get("curve_metrics")
         reference = self.tab.summary.get("reference")
 
+        # Each arm is read against its own reference; see assemble.condition_arms.
+        arm = self._arm()
+        members: list[str] | None = None
+        if arm is not None:
+            reference = arm["reference"]
+            members = list(arm["conditions"])
+
+        def within_arm(table):
+            """``table`` restricted to this arm's reference and conditions."""
+            if members is None or table is None or "condition" not in table.columns:
+                return table
+            return table[table["condition"].isin([reference, *members])]
+
+        if choice == "Effects forest":
+            table = self.tab.tables.get("comparisons")
+            if table is None:
+                raise RuntimeError("comparisons is missing - run stage 06.")
+            return figures.plot_effects_forest(
+                table, metric=metric,
+                title=f"Paired difference in {metric.upper()}, every condition "
+                      "against its reference")
+
         if choice == "Paired metric":
             if metrics is None:
                 raise RuntimeError("curve_metrics is missing - run stage 06.")
-            if reference not in set(metrics["condition"]):
-                reference = sorted(metrics["condition"].unique())[0]
+            scored = set(metrics["condition"])
+            if reference not in scored:
+                raise RuntimeError(f"{reference} is not in the results - nothing to compare against.")
+            subset = within_arm(metrics)
+            targets = [c for c in (members or []) if c in scored] or None
+            if members is not None and not targets:
+                raise RuntimeError(f"No condition of the '{arm['name']}' arm has been scored yet.")
             return figures.plot_paired_metric(
-                metrics, metric=metric, reference=reference,
-                title=f"{metric.upper()} per scan, each condition against {reference}")
+                subset, metric=metric, reference=reference, conditions=targets,
+                title=f"{metric.upper()} per scan against {reference}"
+                      + (f"  -  {arm['question']}" if arm else ""))
 
         if choice == "Bias / variance":
             table = self.tab.tables.get("bias_variance")
             if table is None:
                 raise RuntimeError("bias_variance is missing - run stage 06.")
-            return figures.plot_bias_variance(table, title="Squared error decomposed into bias and variance")
+            return figures.plot_bias_variance(
+                within_arm(table), title="Squared error decomposed into bias and variance",
+                reference=reference)
 
         if choice == "Error by time bin":
             table = self.tab.tables.get("error_by_time_bin")
             if table is None:
                 raise RuntimeError("error_by_time_bin is missing - run stage 06.")
             column = metric if metric in table.columns else "rmse"
-            return figures.plot_error_by_time_bin(table, metric=column,
-                                                  title="Prediction error across the time-activity curve")
+            return figures.plot_error_by_time_bin(
+                within_arm(table), metric=column,
+                title="Prediction error across the time-activity curve")
 
         if choice == "Iteration sweep":
             if metrics is None:
@@ -396,6 +466,19 @@ class _PlotPane(ttk.Frame):
                                    "sweep and evaluate the extra conditions first.")
             return figures.plot_iteration_sweep(sweep, metric=metric,
                                                 title="Sensitivity to the deconvolution iteration count")
+
+        if choice == "PSF sweep":
+            if metrics is None:
+                raise RuntimeError("curve_metrics is missing - run stage 06.")
+            config = self.tab.config()
+            if config is None:
+                raise RuntimeError("Needs the config (for which condition assumed which PSF).")
+            sweep = assemble.psf_sweep_table(metrics, config.conditions, metric=metric)
+            if not len(sweep) or sweep["psf_scale"].nunique() < 2:
+                raise RuntimeError("Only one PSF scale in the results - run stage 02 with "
+                                   "--psf-sensitivity and evaluate the extra conditions first.")
+            return figures.plot_psf_sweep(sweep, metric=metric,
+                                          title="Sensitivity to the assumed PSF width")
 
         if choice == "Recovery vs noise":
             diag = self.tab.diagnostics

@@ -466,6 +466,7 @@ def train_condition(
     seed: int = 42,
     resume: bool = True,
     folds: Sequence[Fold] | None = None,
+    partition: Sequence[Fold] | None = None,
     augment_on_device: bool | None = None,
 ) -> list[RunResult]:
     """Run the full cross-validated training protocol for one condition.
@@ -481,14 +482,25 @@ def train_condition(
     ``folds`` can be passed in so that every condition uses the *same* folds;
     otherwise they are derived from the scan IDs and the seed, which gives the
     same result as long as the ID list matches.
+
+    ``partition`` is the *whole* cross-validation partition, which may be wider
+    than ``folds``: running one fold per cluster job means each job trains a
+    single fold, and every one of them writes ``folds.json`` into the same
+    condition directory.  Writing only the fold it trained would leave the last
+    job's single fold as the record of the partition -- and stage 06, which
+    scores with the partition the models were trained on, would then evaluate
+    one fold of seven scans and quietly discard the other nine folds'
+    checkpoints.  Writing the full partition makes those concurrent writes
+    identical, so overwriting is harmless.
     """
     augmentation = dict(augmentation or {})
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     folds = list(folds) if folds is not None else make_folds(scan_ids, n_folds, seed)
+    recorded = list(partition) if partition is not None else folds
     (out_dir / "folds.json").write_text(
-        json.dumps([f.as_dict() for f in folds], indent=2), encoding="utf-8"
+        json.dumps([f.as_dict() for f in recorded], indent=2), encoding="utf-8"
     )
 
     # One in-memory copy of every scan for this condition, shared by all runs.

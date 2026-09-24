@@ -250,6 +250,7 @@ def compare_conditions(
     test: str = "wilcoxon",
     alternative: str = "two-sided",
     correction: str = "holm",
+    families: Mapping[str, str] | None = None,
     n_boot: int = 10000,
     alpha: float = 0.05,
     seed: int = 42,
@@ -261,9 +262,18 @@ def compare_conditions(
     repeated runs are collapsed to one value per scan first (mean by default),
     so each scan contributes exactly one paired observation.
 
-    Multiple-comparison correction is applied *within* each metric across
-    conditions, which matches the question being asked: for this metric, does
-    any condition differ from the reference?
+    Multiple-comparison correction controls the family-wise error rate, so what
+    counts as a family has to be stated.  ``families`` maps a condition name to
+    a family label, and the correction is then applied within each (metric,
+    family) group; conditions with no entry fall into one default family.
+
+    Getting this wrong in the permissive direction inflates false positives; in
+    the conservative direction it makes a result depend on how many unrelated
+    questions happened to be asked in the same run.  A study that tests one
+    hypothesis and also reports a sensitivity grid should not have the
+    hypothesis penalised for the size of the grid, because no reader choosing
+    between them would.  Passing ``None`` keeps everything in one family per
+    metric, which is the conservative choice.
     """
     import pandas as pd
 
@@ -313,9 +323,18 @@ def compare_conditions(
                 )
             )
 
-        adjusted = adjust_pvalues([c.p_value for c in comparisons], correction)
-        for comparison, p_adj in zip(comparisons, adjusted):
-            comparison.p_adjusted = p_adj
-            rows.append({**comparison.to_dict(), "correction": correction})
+        # Correct within each family separately.  With no mapping every
+        # condition lands in one family and the behaviour is unchanged.
+        by_family: dict[str, list[PairedComparison]] = {}
+        for comparison in comparisons:
+            label = (families or {}).get(comparison.condition, "all")
+            by_family.setdefault(label, []).append(comparison)
+
+        for label, members in by_family.items():
+            adjusted = adjust_pvalues([c.p_value for c in members], correction)
+            for comparison, p_adj in zip(members, adjusted):
+                comparison.p_adjusted = p_adj
+                rows.append({**comparison.to_dict(), "correction": correction,
+                             "family": label, "family_size": len(members)})
 
     return pd.DataFrame(rows)

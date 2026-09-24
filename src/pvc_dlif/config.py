@@ -54,10 +54,37 @@ class Condition:
     motion: bool
     model: str
     subset: str | None = None
+    checkpoints_from: str | None = None
+    # Multiplier applied to the measured PSF before deconvolution.  None means
+    # the measured value; 0.9 and 1.1 are the mismatch check.  Stage 02 writes
+    # those variants to their own directories and this is what points a
+    # condition at one.
+    psf_scale: float | None = None
+    # Which of motion correction and PVC ran first.  Only meaningful when
+    # `motion` is true.  Both orderings are defensible and the project
+    # description asks for both to be compared: correcting motion first gives
+    # the deconvolution a sharper, better-aligned series to work on, while
+    # correcting it afterwards keeps the deconvolution away from voxels that
+    # interpolation has already smoothed.  Stage 07 writes the two to separate
+    # directories; this is what points a condition at one of them.
+    motion_order: str = "mc_then_pvc"
 
     @property
     def is_corrected(self) -> bool:
         return self.pvc_method is not None
+
+    @property
+    def borrows_checkpoints(self) -> bool:
+        """True when this condition trains nothing and reuses another's weights.
+
+        Such a condition measures a *distribution shift*: models fitted on one
+        input representation, applied to another.  It is what the pretrained
+        conditions do implicitly -- the deployed model was fitted on
+        uncorrected images and is shown corrected ones -- and declaring it
+        explicitly makes the same comparison available for the retrained
+        models, at the cost of inference only.
+        """
+        return self.checkpoints_from is not None
 
     @property
     def input_tag(self) -> str:
@@ -70,7 +97,16 @@ class Condition:
             tag = "orig"
         else:
             tag = f"{self.pvc_method.lower()}_i{self.pvc_iterations}"
+            if self.psf_scale is not None:
+                # Must match the tag stage 02 writes:
+                # f"psf{scale:.2f}".replace(".", "p") -> psf0p90, psf1p10.
+                tag += "_psf" + f"{float(self.psf_scale):.2f}".replace(".", "p")
         if self.motion:
+            # Must match the directories stage 07 writes: the mc-then-pvc
+            # ordering lands in motion/<pvc tag>, the reverse in
+            # motion/pvcfirst_<pvc tag>.  Stage 03 strips the leading "mc_".
+            if self.motion_order == "pvc_then_mc":
+                tag = f"pvcfirst_{tag}"
             tag = f"mc_{tag}"
         return tag
 
@@ -86,6 +122,9 @@ class Condition:
             motion=bool(raw.get("motion", False)),
             model=str(raw.get("model", "pretrained")),
             subset=(str(raw["subset"]) if raw.get("subset") else None),
+            checkpoints_from=(str(raw["checkpoints_from"]) if raw.get("checkpoints_from") else None),
+            psf_scale=(float(pvc["psf_scale"]) if pvc.get("psf_scale") is not None else None),
+            motion_order=str(raw.get("motion_order", "mc_then_pvc")),
         )
 
 
@@ -341,6 +380,7 @@ class Config:
         self,
         *,
         include_motion: bool = False,
+        include_borrowed: bool = False,
         names: Iterable[str] | None = None,
     ) -> list[Condition]:
         """The conditions stage 05 trains, and that stage 06 then compares.
@@ -351,6 +391,12 @@ class Config:
         so training them with the main grid would silently fit them to every
         scan.  Naming one explicitly still selects it.
 
+        Conditions that borrow another condition's checkpoints are excluded by
+        default for a different reason: there is nothing to train.  Counting
+        them in this set would inflate the job grid and leave the progress
+        fraction permanently short of 100 %, because the missing runs would
+        never appear.  Stage 06 asks for them with ``include_borrowed=True``.
+
         Stage 05 and the status report must agree on this set, or the progress
         fraction counts a different grid from the one being trained.
         """
@@ -360,6 +406,7 @@ class Config:
             if c.model == "retrained"
             and (wanted is None or c.name in wanted)
             and (not c.motion or include_motion or wanted is not None)
+            and (not c.borrows_checkpoints or include_borrowed)
         ]
 
     def condition(self, name: str) -> Condition:
@@ -402,6 +449,86 @@ class Config:
         ref = self.get("reference_condition")
         if ref is not None and ref not in names:
             problems.append(f"reference_condition {ref!r} is not one of the defined conditions")
+
+        scales = [float(v) for v in (self.get("sensitivity.psf_scale") or [1.0])]
+        for raw_condition in self.get("conditions", []):
+            scale = (raw_condition.get("pvc") or {}).get("psf_scale")
+            if scale is None:
+                continue
+            here = raw_condition.get("name")
+            if not (raw_condition.get("pvc") or {}).get("method"):
+                problems.append(f"condition {here!r} sets pvc.psf_scale but no pvc.method")
+            if not any(abs(float(scale) - s) < 1e-9 for s in scales):
+                problems.append(
+                    f"condition {here!r} asks for psf_scale {scale}, which is not in "
+                    f"sensitivity.psf_scale {scales}. Stage 02 only writes the scales listed "
+                    "there, so that input tree would never exist."
+                )
+
+        # The ordering a condition asks for has to be one stage 07 actually
+        # runs, or the input directory it names was never written.
+        orders = [str(v) for v in (self.get("motion.order") or ["mc_then_pvc"])]
+        for raw_condition in self.get("conditions", []):
+            order = raw_condition.get("motion_order")
+            if order is None:
+                continue
+            here = raw_condition.get("name")
+            if str(order) not in orders:
+                problems.append(
+                    f"condition {here!r} asks for motion_order {order!r}, which is not in "
+                    f"motion.order {orders}. Stage 07 only writes the orderings listed there."
+                )
+            if not raw_condition.get("motion"):
+                problems.append(
+                    f"condition {here!r} sets motion_order but not motion: true, so the "
+                    "ordering has nothing to order"
+                )
+            elif str(order) == "pvc_then_mc" and not (raw_condition.get("pvc") or {}).get("method"):
+                problems.append(
+                    f"condition {here!r} asks for pvc_then_mc but sets no pvc.method; "
+                    "with no PVC the two orderings are the same series"
+                )
+
+        # A borrowed-checkpoint condition is only meaningful if the condition
+        # it borrows from is one that actually trains, and if borrowing from it
+        # changes the input.  Catching both here means a typo fails at load
+        # rather than after stage 05 has run for days.
+        by_name = {c.get("name"): c for c in self.get("conditions", [])}
+        for raw_condition in self.get("conditions", []):
+            source_name = raw_condition.get("checkpoints_from")
+            if not source_name:
+                continue
+            here = raw_condition.get("name")
+            if source_name == here:
+                problems.append(f"condition {here!r} borrows checkpoints from itself")
+                continue
+            source = by_name.get(source_name)
+            if source is None:
+                problems.append(
+                    f"condition {here!r} borrows checkpoints from {source_name!r}, "
+                    "which is not a defined condition"
+                )
+                continue
+            if source.get("checkpoints_from"):
+                problems.append(
+                    f"condition {here!r} borrows from {source_name!r}, which itself borrows; "
+                    "point it at the condition that is actually trained"
+                )
+            if str(source.get("model", "pretrained")) != "retrained":
+                problems.append(
+                    f"condition {here!r} borrows checkpoints from {source_name!r}, but that "
+                    "condition is not retrained, so there are no checkpoints to borrow"
+                )
+            def _input_of(c: Mapping[str, Any]) -> tuple:
+                return (tuple(sorted((c.get("pvc") or {}).items())),
+                        bool(c.get("motion")),
+                        str(c.get("motion_order", "mc_then_pvc")) if c.get("motion") else "")
+
+            if _input_of(raw_condition) == _input_of(source):
+                problems.append(
+                    f"condition {here!r} borrows from {source_name!r} but uses the same input; "
+                    "it would duplicate that condition rather than measure a shift"
+                )
 
         primary = int(self.get("pvc.iterations_primary", 15))
         produced = set(self.get("pvc.iterations_grid", [])) | {primary}
