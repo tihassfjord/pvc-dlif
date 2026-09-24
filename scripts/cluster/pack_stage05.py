@@ -27,8 +27,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pickle
 import shutil
+import stat
 import sys
 from pathlib import Path
 
@@ -79,6 +81,27 @@ def _write_lf(path: Path, text: str) -> Path:
     return path
 
 
+
+def _remove_tree(path: Path) -> None:
+    """``shutil.rmtree`` that copes with the read-only bit on Windows.
+
+    ``shutil.copy2`` preserves file attributes, so a read-only source file is
+    copied into the bundle read-only, and on Windows ``os.unlink`` then refuses
+    it with WinError 5.  Repacking into an existing bundle failed partway
+    through, having already deleted some of it, which left the bundle in a
+    state where nothing worked and the error named a file that looked
+    irrelevant.  Clearing the bit and retrying is the documented remedy.
+    """
+    def on_error(func, target, _exc):
+        os.chmod(target, stat.S_IWRITE)
+        func(target)
+
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=lambda f, t, e: on_error(f, t, e))
+    else:
+        shutil.rmtree(path, onerror=on_error)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--config", default=None, help="path to thesis.yaml")
@@ -111,7 +134,7 @@ def main() -> int:
     # ---- this package ------------------------------------------------------
     pkg = out / "pvc-dlif"
     if pkg.exists():
-        shutil.rmtree(pkg)
+        _remove_tree(pkg)
     for item in ("src", "scripts", "pyproject.toml", "environment.yml", "README.md", "LICENSE"):
         source = REPO_ROOT / item
         if source.is_dir():
@@ -125,7 +148,7 @@ def main() -> int:
     repo = DlifRepo(config.dlif_repo)
     repo_dst = out / "dlif_repo"
     if repo_dst.exists():
-        shutil.rmtree(repo_dst)
+        _remove_tree(repo_dst)
     shutil.copytree(repo.src, repo_dst / "src",
                     ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.egg-info", "checkpoints", "*.ipynb"))
     (repo_dst / "COMMIT").write_text((repo.commit() or "unknown") + "\n", encoding="utf-8")
