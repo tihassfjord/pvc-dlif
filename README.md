@@ -137,7 +137,6 @@ the real format, which is enough to exercise every stage end to end.
 | [`docs/findings.md`](docs/findings.md) | Non-obvious things discovered about this data and model — read before changing anything |
 | [`docs/methods.md`](docs/methods.md) | Why the pipeline is built the way it is |
 | [`docs/cluster.md`](docs/cluster.md) | Running the retraining stage as one job per fold on a cluster |
-| [`HANDOVER_PROMPT.md`](HANDOVER_PROMPT.md) | What is unfinished, and the state each part is in |
 
 ---
 
