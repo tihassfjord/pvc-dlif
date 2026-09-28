@@ -12,7 +12,13 @@ the whole evaluation in one pass:
   trade-off across the time-activity curve shows up;
 * the scans where a corrected condition is worse, named rather than averaged;
 * Patlak and two-tissue parameters computed with each predicted input function
-  against the same tissue curves.
+  against the same tissue curves -- per training run, then averaged within the
+  scan, so an ensemble is never scored in place of a model.
+
+Runs that never left the training-loss plateau are excluded from the primary
+tables when ``evaluation.convergence.exclude_unconverged`` is set; the criterion
+is training-side (lowest stored validation loss), never test performance.  The
+same tables over all runs are written with the suffix ``_allruns``.
 
     python scripts/06_evaluate.py
 """
@@ -35,7 +41,8 @@ from pvc_dlif.eval.bias_variance import decompose_by_condition, decompose_frame
 from pvc_dlif.eval.curve_metrics import metrics_frame
 from pvc_dlif.report import assemble
 from pvc_dlif.eval.frames import failure_modes, frame_error_table, summarise_by_bin
-from pvc_dlif.eval.kinetics import compare_kinetics
+from pvc_dlif.eval.convergence import run_convergence
+from pvc_dlif.eval.kinetics_runs import build_tasks, collapse_runs, kinetics_per_run
 from pvc_dlif.eval.stats import compare_conditions
 from pvc_dlif.logging_utils import get_logger, write_provenance
 
@@ -68,6 +75,8 @@ def main() -> int:
     parser.add_argument("--skip-retrained", action="store_true",
                         help="score only the pretrained predictions")
     parser.add_argument("--skip-kinetics", action="store_true")
+    parser.add_argument("--kinetics-jobs", type=int, default=1,
+                        help="worker processes for the per-run kinetic fits")
     parser.add_argument("--reuse-predictions", action="store_true",
                         help="reuse predictions/retrained.* wholesale, without checking it "
                              "against the checkpoints on disk")
@@ -256,6 +265,41 @@ def main() -> int:
         return 0
 
     # ---------------------------------------------------------------- #
+    # Training convergence: which runs are models, and which are not
+    # ---------------------------------------------------------------- #
+    all_predictions = predictions
+    convergence_cfg = config.get("evaluation.convergence", {}) or {}
+    excluded_runs = None
+    retrained_rows = predictions["fold"].notna() & predictions["run"].notna()
+    if bool(convergence_cfg.get("exclude_unconverged", False)) and retrained_rows.any():
+        threshold = float(convergence_cfg.get("val_loss_threshold", 2.0))
+        signature_path = config.dir_predictions / "retrained.signature.json"
+        signature = (json.loads(signature_path.read_text(encoding="utf-8"))
+                     if signature_path.exists() else None)
+        runs = predictions.loc[retrained_rows, ["condition", "fold", "run"]].drop_duplicates()
+        convergence = run_convergence(config.dir_models, runs, signature, threshold)
+        _write(convergence, results_dir / "run_convergence")
+        missing = int((~convergence["summary_found"]).sum())
+        if missing:
+            LOGGER.warning("%d run(s) have no training summary; kept, not excluded", missing)
+        bad = convergence[convergence["converged"] == False]  # noqa: E712 - NaN stays in
+        excluded_runs = bad
+        if not bad.empty:
+            key = pd.MultiIndex.from_frame(bad[["condition", "fold", "run"]])
+            here = pd.MultiIndex.from_arrays([
+                predictions["condition"],
+                pd.to_numeric(predictions["fold"], errors="coerce").astype("Int64"),
+                pd.to_numeric(predictions["run"], errors="coerce").astype("Int64"),
+            ])
+            predictions = predictions[~here.isin(key)].reset_index(drop=True)
+        LOGGER.info(
+            "Excluded %d run(s) that never reached val_loss < %g (%d distinct checkpoints): %s",
+            len(bad), threshold, bad[["source", "fold", "run"]].drop_duplicates().shape[0],
+            ", ".join(sorted({f"{r.source}/f{r.fold:02d}/r{r.run:02d}" for r in bad.itertuples()})),
+        )
+    write_allruns = excluded_runs is not None and not excluded_runs.empty
+
+    # ---------------------------------------------------------------- #
     # Curve metrics
     # ---------------------------------------------------------------- #
     split = float(config.get("evaluation.frame_bins_min", [0, 2.5])[2]
@@ -300,23 +344,32 @@ def main() -> int:
         seed=config.seed,
     )
 
-    frames = []
-    for arm in arms:
-        members = [c for c in arm["conditions"] if c in available]
-        if not members or arm["reference"] not in available:
-            LOGGER.info("arm %s: nothing scored, skipping", arm["name"])
-            continue
-        LOGGER.info("arm %s: %d condition(s) against %s",
-                    arm["name"], len(members), arm["reference"])
-        frames.append(compare_conditions(
-            metrics[metrics["condition"].isin([arm["reference"], *members])],
-            reference=arm["reference"], conditions=members,
-            families={name: arm["name"] for name in members},
-            **stat_kwargs,
-        ))
+    def _compare(scored: pd.DataFrame) -> pd.DataFrame:
+        frames = []
+        for arm in arms:
+            members = [c for c in arm["conditions"] if c in available]
+            if not members or arm["reference"] not in available:
+                LOGGER.info("arm %s: nothing scored, skipping", arm["name"])
+                continue
+            LOGGER.info("arm %s: %d condition(s) against %s",
+                        arm["name"], len(members), arm["reference"])
+            frames.append(compare_conditions(
+                scored[scored["condition"].isin([arm["reference"], *members])],
+                reference=arm["reference"], conditions=members,
+                families={name: arm["name"] for name in members},
+                **stat_kwargs,
+            ))
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
-    comparisons = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    comparisons = _compare(metrics)
     _write(comparisons, results_dir / "comparisons")
+
+    if write_allruns:
+        # Secondary estimand: expected performance of one training run,
+        # including the runs that never fitted.
+        metrics_all = metrics_frame(all_predictions, early_late_split_min=split)
+        _write(metrics_all, results_dir / "curve_metrics_allruns")
+        _write(_compare(metrics_all), results_dir / "comparisons_allruns")
 
     # ---------------------------------------------------------------- #
     # Frame-level analysis
@@ -345,48 +398,38 @@ def main() -> int:
     # ---------------------------------------------------------------- #
     if not args.skip_kinetics and bool(config.get("evaluation.kinetics.enabled", True)):
         target_vois = list(config.get("evaluation.kinetics.target_vois", []))
-        # ``null`` in the config means the Patlak break point is fitted per
-        # curve, which is the reference implementation's behaviour and the
-        # default here; a number pins it, for the sensitivity check.
+        # "truth": the break point fitted with the true input, used unchanged
+        # for every predicted input of that scan and VOI (the thesis setting).
+        # ``null``: fitted per curve, the reference implementation's behaviour.
+        # A number pins it for every curve, for the sensitivity check.
         t_star = config.get("evaluation.kinetics.patlak_t_star_min", None)
-        t_star = None if t_star is None else float(t_star)
+        if t_star is not None and not (isinstance(t_star, str) and t_star.lower() == "truth"):
+            t_star = float(t_star)
         # The two-tissue model is reversible unless the config asks otherwise.
         # k4 = 0 is the usual FDG shorthand, but a model that cannot represent
         # washout absorbs any washout present into the other rate constants.
         irreversible = bool(config.get("evaluation.kinetics.irreversible", False))
-        rows: list[dict] = []
-        collapsed = (
-            predictions.groupby(["condition", "scan_id", "frame"], dropna=False)
-            .agg(predicted=("predicted", "mean"), truth=("truth", "first"),
-                 time_min=("time_min", "first"))
-            .reset_index()
-        )
-        for (condition, scan_id), group in collapsed.groupby(["condition", "scan_id"]):
-            if not pkl_io.voi_path(config.dlif_data_root, scan_id).exists():
-                continue
-            curves, voi_time = pkl_io.load_voi(config.dlif_data_root, scan_id)
-            selected = {k: v for k, v in curves.items() if not target_vois or k in target_vois}
-            group = group.sort_values("frame")
-            try:
-                for row in compare_kinetics(
-                    group["predicted"].to_numpy(),
-                    group["truth"].to_numpy(),
-                    selected,
-                    voi_time,
-                    models=list(config.get("evaluation.kinetics.models", ["patlak"])),
-                    t_star_min=t_star,
-                    # The VOI filter has already been applied above, from the
-                    # config, so the selection is not narrowed a second time
-                    # here -- a liver row appears exactly when the config asks
-                    # for one.
-                    vois=None,
-                    irreversible=irreversible,
-                ):
-                    rows.append({"condition": condition, "scan_id": scan_id, **row})
-            except Exception as exc:  # noqa: BLE001
-                LOGGER.warning("kinetics failed for %s / %s: %s", condition, scan_id, exc)
-        if rows:
-            _write(pd.DataFrame(rows), results_dir / "kinetics")
+        if isinstance(t_star, str):
+            t_star = "truth"
+        tasks = build_tasks(
+            all_predictions, pkl_io.load_voi, config.dlif_data_root, target_vois,
+            list(config.get("evaluation.kinetics.models", ["patlak"])), t_star, irreversible)
+        per_run = kinetics_per_run(tasks, jobs=max(1, int(args.kinetics_jobs)))
+        if not per_run.empty:
+            if write_allruns:
+                bad_key = pd.MultiIndex.from_frame(excluded_runs[["condition", "fold", "run"]])
+                here = pd.MultiIndex.from_arrays([
+                    per_run["condition"],
+                    pd.to_numeric(per_run["fold"], errors="coerce").astype("Int64"),
+                    pd.to_numeric(per_run["run"], errors="coerce").astype("Int64"),
+                ])
+                per_run["converged_run"] = ~here.isin(bad_key)
+            else:
+                per_run["converged_run"] = True
+            _write(per_run, results_dir / "kinetics_runs")
+            _write(collapse_runs(per_run[per_run["converged_run"]]), results_dir / "kinetics")
+            if write_allruns:
+                _write(collapse_runs(per_run), results_dir / "kinetics_allruns")
 
     # ---------------------------------------------------------------- #
     # Headline summary

@@ -60,7 +60,8 @@ def format_value(value: Any, digits: int = 3) -> str:
     if not np.isfinite(number):
         return "--"
     if number != 0 and (abs(number) < 10 ** (-digits) or abs(number) >= 10 ** 5):
-        return f"{number:.{digits}e}".replace("e", r"\times 10^{") + "}"
+        mantissa, exponent = f"{number:.{digits}e}".split("e")
+        return rf"${mantissa} \times 10^{{{int(exponent)}}}$"
     return f"{number:.{digits}f}"
 
 
@@ -184,7 +185,7 @@ def metrics_summary_table(
                 cells.append("--")
                 continue
             q1, median, q3 = np.percentile(values, [25, 50, 75])
-            cells.append(f"{format_value(median)} ({format_value(q1)}--{format_value(q3)})")
+            cells.append(f"{format_value(median)} ({format_value(q1)}\\,--\\,{format_value(q3)})")
         rows.append(cells)
 
     return latex_table(

@@ -80,10 +80,21 @@ def decompose(predictions: Sequence[Sequence[float]] | np.ndarray, truth: Sequen
 
     mean_prediction = y.mean(axis=0)
     per_frame_bias = mean_prediction - g
-    per_frame_bias_sq = per_frame_bias ** 2
-    # Population variance across repeats: it is the variance term of the
-    # decomposition, not a sample estimate of a wider population.
-    per_frame_var = y.var(axis=0, ddof=0) if n_repeats > 1 else np.zeros_like(g)
+    # Both terms are estimated without bias for the population of training
+    # runs, so conditions with different numbers of runs are comparable (runs
+    # excluded for non-convergence leave 8-10 per scan).  The sample variance
+    # s^2 (ddof=1) estimates the run variance; (mean - g)^2 overestimates the
+    # squared bias by s^2 / R, which is subtracted.  The two still sum exactly
+    # to the empirical MSE:  (mean-g)^2 - s^2/R + s^2 = (mean-g)^2 + s^2 (R-1)/R.
+    # A frame's bias^2 estimate can be slightly negative when the bias is
+    # small against the run spread; it is kept, not clipped, so averages stay
+    # unbiased.
+    if n_repeats > 1:
+        per_frame_var = y.var(axis=0, ddof=1)
+        per_frame_bias_sq = per_frame_bias ** 2 - per_frame_var / n_repeats
+    else:
+        per_frame_var = np.zeros_like(g)
+        per_frame_bias_sq = per_frame_bias ** 2
 
     mse = float(np.mean((y - g[None, :]) ** 2))
 

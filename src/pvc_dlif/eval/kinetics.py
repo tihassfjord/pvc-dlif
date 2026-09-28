@@ -296,6 +296,8 @@ class TwoTissueResult:
     #: many there were.
     bounds_hit: bool = False
     message: str = ""
+    #: 1 - SS_res / SS_tot of the tissue fit, on the uniform grid it was fitted on.
+    r_squared: float = float("nan")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -378,12 +380,14 @@ def fit_two_tissue(
 
     fitted = model(t, *popt)
     rmse = float(np.sqrt(np.mean((fitted - c_t) ** 2)))
+    ss_tot = float(np.sum((c_t - c_t.mean()) ** 2))
+    r_squared = float(1 - np.sum((fitted - c_t) ** 2) / ss_tot) if ss_tot > 1e-12 else float("nan")
     ki = float(k1 * k3 / (k2 + k3)) if (k2 + k3) > 1e-12 else float("nan")
 
     return TwoTissueResult(
         k1=float(k1), k2=float(k2), k3=float(k3), k4=float(k4), vb=float(vb),
         ki=ki, rmse=rmse, converged=converged, irreversible=bool(irreversible),
-        bounds_hit=bounds_hit, message=message,
+        bounds_hit=bounds_hit, message=message, r_squared=r_squared,
     )
 
 
@@ -462,6 +466,8 @@ def compare_kinetics(
                         "converged_truth": with_truth.converged,
                         "bounds_hit_predicted": with_pred.bounds_hit,
                         "bounds_hit_truth": with_truth.bounds_hit,
+                        "r_squared_predicted": with_pred.r_squared,
+                        "r_squared_truth": with_truth.r_squared,
                         "irreversible": bool(irreversible),
                     }
                 )

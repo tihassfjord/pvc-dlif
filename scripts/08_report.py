@@ -349,8 +349,31 @@ def main() -> int:
     # -- curve overlays for example scans ---------------------------------- #
     predictions = assemble.load_predictions(config.dir_predictions)
 
+    # The curve overlays read the raw predictions, so they must drop the runs
+    # stage 06 excluded (never left the training plateau); otherwise the drawn
+    # run-mean curve is not the one the tables score.
+    convergence_path = results / "run_convergence.csv"
+    if (predictions is not None and convergence_path.exists()
+            and bool(config.get("evaluation.convergence.exclude_unconverged", False))):
+        convergence = pd.read_csv(convergence_path)
+        bad = convergence[convergence["converged"] == False]  # noqa: E712
+        if not bad.empty:
+            key = pd.MultiIndex.from_frame(bad[["condition", "fold", "run"]].astype(
+                {"fold": "Int64", "run": "Int64"}))
+            here = pd.MultiIndex.from_arrays([
+                predictions["condition"],
+                pd.to_numeric(predictions["fold"], errors="coerce").astype("Int64"),
+                pd.to_numeric(predictions["run"], errors="coerce").astype("Int64"),
+            ])
+            predictions = predictions[~here.isin(key)].reset_index(drop=True)
+            LOGGER.info("Curve overlays: dropped %d non-converged (condition, run) pairs", len(bad))
+
     if predictions is not None:
-        reference_metrics = metrics[metrics["condition"] == reference].sort_values("rmse")
+        # Rank scans by their run-averaged RMSE, not by individual run rows:
+        # ranking rows picks the scans whose single worst run is worst.
+        reference_metrics = (metrics[metrics["condition"] == reference]
+                             .groupby("scan_id", as_index=False)["rmse"].mean()
+                             .sort_values("rmse"))
         if args.example_scans:
             examples = list(args.example_scans)
         elif len(reference_metrics) >= 3:
